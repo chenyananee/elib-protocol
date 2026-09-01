@@ -1,0 +1,23 @@
+#ifndef ELIB_PROTOCOL_ERR_H
+#define ELIB_PROTOCOL_ERR_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    ELIB_PROTOCOL_OK = 0,
+    ELIB_PROTOCOL_ERR_INVALID_PARAM,
+    ELIB_PROTOCOL_ERR_BUFFER_TOO_SMALL,
+    ELIB_PROTOCOL_ERR_TIMEOUT,
+    ELIB_PROTOCOL_ERR_CHECKSUM,
+    ELIB_PROTOCOL_ERR_FRAME,
+    ELIB_PROTOCOL_ERR_BUSY,
+    ELIB_PROTOCOL_ERR_UNKNOWN
+} elib_protocol_err_t;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ELIB_PROTOCOL_ERR_H */

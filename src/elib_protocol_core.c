@@ -339,18 +339,19 @@ size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
     return 5 + len;
 }
 
-size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t data_len)
+size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset)
 {
-    if (!buf || buf_size < ELIB_PROTOCOL_FRAME_OVERHEAD + data_len) {
+    if (!buf || offset < ELIB_PROTOCOL_FRAME_OVERHEAD || offset > buf_size) {
         return 0;
     }
 
-    size_t frame_len = ELIB_PROTOCOL_FRAME_OVERHEAD + data_len;
+    size_t data_len = offset - ELIB_PROTOCOL_FRAME_OVERHEAD;
+    size_t frame_len = offset;
     buf[1] = (frame_len >> 8) & 0xFF;
     buf[2] = frame_len & 0xFF;
 
     uint8_t meta_count = 0;
-    size_t pos = 10;
+    size_t pos = ELIB_PROTOCOL_FRAME_OVERHEAD;
     while (pos < frame_len - 3) {
         meta_count++;
         uint16_t meta_len = ((uint16_t)buf[pos + 3] << 8) | buf[pos + 4];

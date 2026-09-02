@@ -211,8 +211,8 @@ size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), addr, seq, de
 offset += elib_protocol_build_meta(tx_buf + offset, sizeof(tx_buf) - offset,
                                    0x0001, ELIB_PROTOCOL_DATA_U8, &val, 1);
 
-// 3. 打包完成帧
-size_t frame_len = elib_protocol_build_pack(tx_buf, sizeof(tx_buf), offset - 10);
+// 3. 打包完成帧（传入当前offset，内部自动计算长度）
+size_t frame_len = elib_protocol_build_pack(tx_buf, sizeof(tx_buf), offset);
 
 // 4. 发送
 send_data(tx_buf, frame_len);

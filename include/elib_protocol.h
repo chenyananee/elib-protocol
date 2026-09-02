@@ -84,10 +84,10 @@ size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
  * Frame builder - finalize frame (calculate length, CRC, add tail)
  * @param buf       output buffer (starting from header)
  * @param buf_size  buffer size
- * @param data_len  data unit length (excluding meta_count)
+ * @param offset    current write position (return value from build_header/build_meta)
  * @return total frame length, or 0 on error
  */
-size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t data_len);
+size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset);
 
 #ifdef __cplusplus
 }

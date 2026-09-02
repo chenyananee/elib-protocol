@@ -15,8 +15,8 @@ elib_protocol_err_t elib_protocol_slave_init(elib_protocol_slave_ctx_t *ctx,
     ctx->tick_ms     = 0;
     ctx->timeout_cfg = cfg->timeout_ms;
     ctx->prev_rx_len = 0;
-    memcpy(ctx->self_addr, cfg->addr, 4);
     elib_protocol_ctx_init(ctx);
+    memcpy(ctx->self_addr, cfg->addr, 4);
 
     return ELIB_PROTOCOL_OK;
 }

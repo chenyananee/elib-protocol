@@ -151,6 +151,28 @@ LEN字节，实际数据。
 
 ---
 
+## 字节序转换
+
+协议使用大端序（网络字节序），提供以下转换函数：
+
+```c
+uint16_t elib_protocol_swap16(uint16_t val);
+uint32_t elib_protocol_swap32(uint32_t val);
+uint64_t elib_protocol_swap64(uint64_t val);
+```
+
+使用示例：
+```c
+// 写入16位大端序数据
+uint16_t val = 0x1234;
+buf[0] = (val >> 8) & 0xFF;
+buf[1] = val & 0xFF;
+
+// 或使用转换函数
+uint16_t be_val = elib_protocol_swap16(val);
+memcpy(buf, &be_val, 2);
+```
+
 ## 错误处理
 
 ### 无效帧

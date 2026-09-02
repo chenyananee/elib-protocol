@@ -313,7 +313,7 @@ size_t elib_protocol_build_header(uint8_t *buf, size_t buf_size,
     if (addr) {
         memcpy(&buf[3], addr, 4);
     } else {
-        memset(&buf[3], 0, 4);
+        memset(&buf[3], 0xFF, 4);
     }
     buf[7] = seq;
     buf[8] = desc;

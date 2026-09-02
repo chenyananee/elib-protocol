@@ -57,7 +57,7 @@ elib_protocol_err_t elib_protocol_get_next_meta(size_t *pos,
  * Frame builder - build frame header
  * @param buf       output buffer
  * @param buf_size  output buffer size
- * @param addr      slave address (4 bytes, can be NULL for broadcast)
+ * @param addr      slave address (4 bytes, NULL for broadcast 0xFFFFFFFF)
  * @param seq       sequence number (0-255)
  * @param desc      descriptor byte
  * @return bytes written (10), or 0 on error

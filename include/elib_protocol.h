@@ -89,6 +89,58 @@ size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
  */
 size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset);
 
+/**
+ * Byte order helpers - big endian (network byte order)
+ */
+static inline uint16_t elib_protocol_htobe16(uint16_t val)
+{
+    return (uint16_t)((val >> 8) | (val << 8));
+}
+
+static inline uint32_t elib_protocol_htobe32(uint32_t val)
+{
+    return ((val >> 24) & 0x000000FF) |
+           ((val >> 8)  & 0x0000FF00) |
+           ((val << 8)  & 0x00FF0000) |
+           ((val << 24) & 0xFF000000);
+}
+
+static inline uint16_t elib_protocol_be16toh(uint16_t val)
+{
+    return (uint16_t)((val >> 8) | (val << 8));
+}
+
+static inline uint32_t elib_protocol_be32toh(uint32_t val)
+{
+    return ((val >> 24) & 0x000000FF) |
+           ((val >> 8)  & 0x0000FF00) |
+           ((val << 8)  & 0x00FF0000) |
+           ((val << 24) & 0xFF000000);
+}
+
+/**
+ * Byte order helpers - little endian
+ */
+static inline uint16_t elib_protocol_htole16(uint16_t val)
+{
+    return val;
+}
+
+static inline uint32_t elib_protocol_htole32(uint32_t val)
+{
+    return val;
+}
+
+static inline uint16_t elib_protocol_le16toh(uint16_t val)
+{
+    return val;
+}
+
+static inline uint32_t elib_protocol_le32toh(uint32_t val)
+{
+    return val;
+}
+
 #ifdef __cplusplus
 }
 #endif

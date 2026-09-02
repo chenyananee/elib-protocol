@@ -314,11 +314,11 @@ if (consumed > 0) {
 
 ```c
 uint8_t tx_buf[128];
-uint8_t master_addr[4] = {0x00, 0x00, 0x00, 0x00};  // 主机地址
+uint8_t self_addr[4] = {0x00, 0x00, 0x00, 0x01};  // 自身地址
 uint8_t val = 0xAA;
 
 // 1. 生成帧头
-size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), master_addr, seq, desc);
+size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), self_addr, seq, desc);
 
 // 2. 添加元数据（可多次调用）
 offset += elib_protocol_build_meta(tx_buf + offset, sizeof(tx_buf) - offset,

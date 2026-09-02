@@ -46,7 +46,6 @@ typedef struct {
     elib_protocol_state_t state;
     uint16_t length;
     uint16_t rx_cnt;
-    uint8_t  addr[4];
     uint8_t  seq;
     uint8_t  desc;
     uint16_t crc;
@@ -66,7 +65,6 @@ uint8_t elib_protocol_meta_get_count(const uint8_t *data, size_t len);
 
 elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
                                                uint8_t byte,
-                                               uint8_t *frame_addr,
                                                uint8_t *frame_seq,
                                                uint8_t *frame_desc,
                                                size_t *frame_data_len);

@@ -45,7 +45,6 @@ uint8_t elib_protocol_desc_get_dir(uint8_t desc)
 
 elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
                                                uint8_t byte,
-                                               uint8_t *frame_addr,
                                                uint8_t *frame_seq,
                                                uint8_t *frame_desc,
                                                size_t *frame_data_len)
@@ -78,23 +77,10 @@ elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
         break;
 
     case ELIB_PROTOCOL_STATE_ADDR0:
-        ctx->addr[0] = byte;
-        ctx->state   = ELIB_PROTOCOL_STATE_ADDR1;
-        break;
-
     case ELIB_PROTOCOL_STATE_ADDR1:
-        ctx->addr[1] = byte;
-        ctx->state   = ELIB_PROTOCOL_STATE_ADDR2;
-        break;
-
     case ELIB_PROTOCOL_STATE_ADDR2:
-        ctx->addr[2] = byte;
-        ctx->state   = ELIB_PROTOCOL_STATE_ADDR3;
-        break;
-
     case ELIB_PROTOCOL_STATE_ADDR3:
-        ctx->addr[3] = byte;
-        ctx->state   = ELIB_PROTOCOL_STATE_SEQ;
+        ctx->state++;
         break;
 
     case ELIB_PROTOCOL_STATE_SEQ:
@@ -130,9 +116,6 @@ elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
         if (byte != ELIB_PROTOCOL_FRAME_TAIL) {
             return ELIB_PROTOCOL_ERR_FRAME;
         }
-        if (frame_addr) {
-            memcpy(frame_addr, ctx->addr, 4);
-        }
         if (frame_seq) {
             *frame_seq = ctx->seq;
         }
@@ -148,8 +131,6 @@ elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
         ctx->state = ELIB_PROTOCOL_STATE_IDLE;
         break;
     }
-
-    (void)buf_size;
 
     return ELIB_PROTOCOL_ERR_FRAME;
 }
@@ -198,9 +179,7 @@ void elib_protocol_ctx_init(elib_protocol_ctx_t *ctx)
     ctx->parse_state  = ELIB_PROTOCOL_STATE_IDLE;
     ctx->parse_length = 0;
     ctx->parse_rx_cnt = 0;
-    memset(ctx->parse_addr, 0, 4);
     ctx->frame_pos    = 0;
-    memset(ctx->self_addr, 0, 4);
 }
 
 elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
@@ -240,12 +219,11 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
 
             elib_protocol_err_t err = elib_protocol_parse_byte(
                 &p, ctx->bufs.rx_frame_buf[i],
-                ctx->parse_addr, &ctx->parse_seq, &ctx->parse_desc, NULL);
+                &ctx->parse_seq, &ctx->parse_desc, NULL);
 
             ctx->parse_state  = p.state;
             ctx->parse_length = p.length;
             ctx->parse_rx_cnt = p.rx_cnt;
-            memcpy(ctx->parse_addr, p.addr, 4);
 
             if (ctx->parse_state == ELIB_PROTOCOL_STATE_SEQ) {
                 if (ctx->frame_pos + ctx->parse_length > ctx->bufs.rx_frame_buf_size) {
@@ -253,12 +231,11 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
                     continue;
                 }
 
-                uint8_t is_broadcast = (ctx->parse_addr[0] == 0xFF &&
-                                        ctx->parse_addr[1] == 0xFF &&
-                                        ctx->parse_addr[2] == 0xFF &&
-                                        ctx->parse_addr[3] == 0xFF);
+                uint8_t *addr = &ctx->bufs.rx_frame_buf[ctx->frame_pos + 3];
+                uint8_t is_broadcast = (addr[0] == 0xFF && addr[1] == 0xFF &&
+                                        addr[2] == 0xFF && addr[3] == 0xFF);
                 if (!is_broadcast &&
-                    memcmp(ctx->parse_addr, ctx->self_addr, 4) != 0) {
+                    memcmp(addr, ctx->self_addr, 4) != 0) {
                     ctx->parse_state = ELIB_PROTOCOL_STATE_IDLE;
                     continue;
                 }
@@ -276,9 +253,9 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
             if (err == ELIB_PROTOCOL_OK) {
                 if (ctx->ops->on_frame &&
                     elib_protocol_desc_get_dir(ctx->parse_desc) == dir) {
+                    uint8_t *addr = &ctx->bufs.rx_frame_buf[ctx->frame_pos + 3];
                     elib_protocol_frame_ctx_t frame = {
-                        .addr     = {ctx->parse_addr[0], ctx->parse_addr[1],
-                                     ctx->parse_addr[2], ctx->parse_addr[3]},
+                        .addr     = {addr[0], addr[1], addr[2], addr[3]},
                         .seq      = ctx->parse_seq,
                         .desc     = ctx->parse_desc,
                         .data     = &ctx->bufs.rx_frame_buf[ctx->frame_pos + ELIB_PROTOCOL_FRAME_OVERHEAD],

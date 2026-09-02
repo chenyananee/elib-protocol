@@ -74,7 +74,6 @@ typedef struct {
     uint8_t                    parse_state;
     uint16_t                   parse_length;
     uint16_t                   parse_rx_cnt;
-    uint8_t                    parse_addr[4];
     uint8_t                    parse_seq;
     uint8_t                    parse_desc;
     size_t                     frame_pos;

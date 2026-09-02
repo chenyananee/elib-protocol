@@ -9,8 +9,9 @@ extern "C" {
 
 #define ELIB_PROTOCOL_FRAME_HEAD       0x68
 #define ELIB_PROTOCOL_FRAME_TAIL       0x16
-#define ELIB_PROTOCOL_FRAME_OVERHEAD   8
-#define ELIB_PROTOCOL_FRAME_LEN_MIN    8
+#define ELIB_PROTOCOL_FRAME_OVERHEAD   12
+#define ELIB_PROTOCOL_FRAME_LEN_MIN    12
+#define ELIB_PROTOCOL_ADDR_LEN         4
 
 #define ELIB_PROTOCOL_DESC_TYPE_MASK   0x06
 #define ELIB_PROTOCOL_DESC_TYPE_REQ    0x00
@@ -29,6 +30,10 @@ typedef enum {
     ELIB_PROTOCOL_STATE_IDLE,
     ELIB_PROTOCOL_STATE_LEN_H,
     ELIB_PROTOCOL_STATE_LEN_L,
+    ELIB_PROTOCOL_STATE_ADDR0,
+    ELIB_PROTOCOL_STATE_ADDR1,
+    ELIB_PROTOCOL_STATE_ADDR2,
+    ELIB_PROTOCOL_STATE_ADDR3,
     ELIB_PROTOCOL_STATE_SEQ,
     ELIB_PROTOCOL_STATE_DESC,
     ELIB_PROTOCOL_STATE_DATA,
@@ -41,6 +46,7 @@ typedef struct {
     elib_protocol_state_t state;
     uint16_t length;
     uint16_t rx_cnt;
+    uint8_t  addr[4];
     uint8_t  seq;
     uint8_t  desc;
     uint16_t crc;
@@ -60,6 +66,7 @@ uint8_t elib_protocol_meta_get_count(const uint8_t *data, size_t len);
 
 elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
                                                uint8_t byte,
+                                               uint8_t *frame_addr,
                                                uint8_t *frame_seq,
                                                uint8_t *frame_desc,
                                                size_t *frame_data_len);

@@ -41,7 +41,8 @@ static int test_valid_frame(void)
 
     uint8_t frame[] = {
         0x68,
-        0x00, 0x0F,
+        0x00, 0x13,
+        0x00, 0x00, 0x00, 0x01,
         0x01,
         0x02,
         0x01,
@@ -77,7 +78,8 @@ static int test_invalid_crc(void)
 
     uint8_t frame[] = {
         0x68,
-        0x00, 0x0F,
+        0x00, 0x13,
+        0x00, 0x00, 0x00, 0x01,
         0x01,
         0x02,
         0x01,
@@ -86,8 +88,8 @@ static int test_invalid_crc(void)
         0x16
     };
 
-    frame[12] = 0xFF;
-    frame[13] = 0xFF;
+    frame[16] = 0xFF;
+    frame[17] = 0xFF;
 
     memcpy(rx_frame_buf, frame, sizeof(frame));
     frame_received = 0;

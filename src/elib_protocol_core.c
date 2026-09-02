@@ -45,6 +45,7 @@ uint8_t elib_protocol_desc_get_dir(uint8_t desc)
 
 elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
                                                uint8_t byte,
+                                               uint8_t *frame_addr,
                                                uint8_t *frame_seq,
                                                uint8_t *frame_desc,
                                                size_t *frame_data_len)
@@ -71,9 +72,29 @@ elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
         if (ctx->length < ELIB_PROTOCOL_FRAME_LEN_MIN) {
             ctx->state = ELIB_PROTOCOL_STATE_IDLE;
         } else {
-            ctx->state  = ELIB_PROTOCOL_STATE_SEQ;
+            ctx->state  = ELIB_PROTOCOL_STATE_ADDR0;
             ctx->rx_cnt = 0;
         }
+        break;
+
+    case ELIB_PROTOCOL_STATE_ADDR0:
+        ctx->addr[0] = byte;
+        ctx->state   = ELIB_PROTOCOL_STATE_ADDR1;
+        break;
+
+    case ELIB_PROTOCOL_STATE_ADDR1:
+        ctx->addr[1] = byte;
+        ctx->state   = ELIB_PROTOCOL_STATE_ADDR2;
+        break;
+
+    case ELIB_PROTOCOL_STATE_ADDR2:
+        ctx->addr[2] = byte;
+        ctx->state   = ELIB_PROTOCOL_STATE_ADDR3;
+        break;
+
+    case ELIB_PROTOCOL_STATE_ADDR3:
+        ctx->addr[3] = byte;
+        ctx->state   = ELIB_PROTOCOL_STATE_SEQ;
         break;
 
     case ELIB_PROTOCOL_STATE_SEQ:
@@ -108,6 +129,9 @@ elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
         ctx->state = ELIB_PROTOCOL_STATE_IDLE;
         if (byte != ELIB_PROTOCOL_FRAME_TAIL) {
             return ELIB_PROTOCOL_ERR_FRAME;
+        }
+        if (frame_addr) {
+            memcpy(frame_addr, ctx->addr, 4);
         }
         if (frame_seq) {
             *frame_seq = ctx->seq;
@@ -174,6 +198,7 @@ void elib_protocol_ctx_init(elib_protocol_ctx_t *ctx)
     ctx->parse_state  = ELIB_PROTOCOL_STATE_IDLE;
     ctx->parse_length = 0;
     ctx->parse_rx_cnt = 0;
+    memset(ctx->parse_addr, 0, 4);
     ctx->frame_pos    = 0;
 }
 
@@ -214,11 +239,12 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
 
             elib_protocol_err_t err = elib_protocol_parse_byte(
                 &p, ctx->bufs.rx_frame_buf[i],
-                &ctx->parse_seq, &ctx->parse_desc, NULL);
+                ctx->parse_addr, &ctx->parse_seq, &ctx->parse_desc, NULL);
 
             ctx->parse_state  = p.state;
             ctx->parse_length = p.length;
             ctx->parse_rx_cnt = p.rx_cnt;
+            memcpy(ctx->parse_addr, p.addr, 4);
 
             if (ctx->parse_state == ELIB_PROTOCOL_STATE_SEQ &&
                 ctx->frame_pos + ctx->parse_length > ctx->bufs.rx_frame_buf_size) {
@@ -239,6 +265,8 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
                 if (ctx->ops->on_frame &&
                     elib_protocol_desc_get_dir(ctx->parse_desc) == dir) {
                     elib_protocol_frame_ctx_t frame = {
+                        .addr     = {ctx->parse_addr[0], ctx->parse_addr[1],
+                                     ctx->parse_addr[2], ctx->parse_addr[3]},
                         .seq      = ctx->parse_seq,
                         .desc     = ctx->parse_desc,
                         .data     = &ctx->bufs.rx_frame_buf[ctx->frame_pos + ELIB_PROTOCOL_FRAME_OVERHEAD],
@@ -272,6 +300,7 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
 }
 
 size_t elib_protocol_build_header(uint8_t *buf, size_t buf_size,
+                                  const uint8_t *addr,
                                   uint8_t seq, uint8_t desc)
 {
     if (!buf || buf_size < ELIB_PROTOCOL_FRAME_OVERHEAD + 1) {
@@ -281,11 +310,16 @@ size_t elib_protocol_build_header(uint8_t *buf, size_t buf_size,
     buf[0] = ELIB_PROTOCOL_FRAME_HEAD;
     buf[1] = 0;
     buf[2] = 0;
-    buf[3] = seq;
-    buf[4] = desc;
-    buf[5] = 0;
+    if (addr) {
+        memcpy(&buf[3], addr, 4);
+    } else {
+        memset(&buf[3], 0, 4);
+    }
+    buf[7] = seq;
+    buf[8] = desc;
+    buf[9] = 0;
 
-    return 6;
+    return 10;
 }
 
 size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
@@ -320,13 +354,13 @@ size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t data_len)
     buf[2] = frame_len & 0xFF;
 
     uint8_t meta_count = 0;
-    size_t pos = 6;
+    size_t pos = 10;
     while (pos < frame_len - 3) {
         meta_count++;
         uint16_t meta_len = ((uint16_t)buf[pos + 3] << 8) | buf[pos + 4];
         pos += 5 + meta_len;
     }
-    buf[5] = meta_count;
+    buf[9] = meta_count;
 
     uint16_t crc = elib_protocol_crc16_calc(buf, frame_len - 3);
     buf[frame_len - 3] = (crc >> 8) & 0xFF;

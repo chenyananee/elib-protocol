@@ -19,7 +19,7 @@ elib-protocol是一个轻量级嵌入式通信协议库，专为主从架构设�
 ### 帧格式
 
 ```
-[0x68] [LEN_H] [LEN_L] [SEQ] [DESC] [DATA...] [CRC_H] [CRC_L] [0x16]
+[0x68] [LEN_H] [LEN_L] [ADDR0] [ADDR1] [ADDR2] [ADDR3] [SEQ] [DESC] [DATA...] [CRC_H] [CRC_L] [0x16]
 ```
 
 | 字段 | 长度 | 说明 |
@@ -27,6 +27,7 @@ elib-protocol是一个轻量级嵌入式通信协议库，专为主从架构设�
 | 0x68 | 1 | 帧头，固定值 |
 | LEN_H | 1 | 帧长度高字节 |
 | LEN_L | 1 | 帧长度低字节 |
+| ADDR0-3 | 4 | 从机地址码（4字节） |
 | SEQ | 1 | 序列号，0-255循环 |
 | DESC | 1 | 描述符 |
 | DATA | N | 数据单元 |
@@ -36,12 +37,19 @@ elib-protocol是一个轻量级嵌入式通信协议库，专为主从架构设�
 
 ### 帧长度
 
-`LEN = N + 8`
+`LEN = N + 12`
 
 - N为数据单元长度
-- 8为帧头(1) + 长度(2) + 序列号(1) + 描述符(1) + CRC(2) + 帧尾(1)
-- 最小帧长：8（无数据）
+- 12为帧头(1) + 长度(2) + 地址(4) + 序列号(1) + 描述符(1) + CRC(2) + 帧尾(1)
+- 最小帧长：12（无数据）
 - 最大帧长：由缓冲区大小决定
+
+### 从机地址（ADDR）
+
+- 4字节地址码，用于多机通信
+- 主机请求从机时，指定目标从机地址
+- 从机响应或主动上报时，携带自身地址
+- 广播地址：0x00000000（所有从机接收）
 
 ### 描述符（DESC）
 
@@ -181,16 +189,17 @@ elib_protocol_slave_process(&slave, dt_ms, rx_len, &consumed);
 ```c
 uint8_t tx_buf[128];
 uint8_t val = 0xFF;
+uint8_t addr[4] = {0x00, 0x00, 0x00, 0x01};  // 从机地址
 
-// 1. 生成帧头（6字节）
-size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), seq, desc);
+// 1. 生成帧头（10字节）
+size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), addr, seq, desc);
 
 // 2. 添加元数据（可多次调用）
 offset += elib_protocol_build_meta(tx_buf + offset, sizeof(tx_buf) - offset,
                                    0x0001, ELIB_PROTOCOL_DATA_U8, &val, 1);
 
 // 3. 打包完成帧
-size_t frame_len = elib_protocol_build_pack(tx_buf, sizeof(tx_buf), offset - 6);
+size_t frame_len = elib_protocol_build_pack(tx_buf, sizeof(tx_buf), offset - 10);
 
 // 4. 发送
 send_data(tx_buf, frame_len);
@@ -230,7 +239,7 @@ static void on_frame(const elib_protocol_frame_ctx_t *ctx) {
 
 ### 无效帧
 
-- 长度 < 8：帧过短
+- 长度 < 12：帧过短
 - 帧尾 ≠ 0x16：帧尾错误
 - CRC不匹配：校验错误
 
@@ -249,20 +258,22 @@ static void on_frame(const elib_protocol_frame_ctx_t *ctx) {
 ### 无数据帧
 
 ```
-[0x68][0x00][0x08][0x01][0x02][CRC_H][CRC_L][0x16]
+[0x68][0x00][0x0C][0x00][0x00][0x00][0x01][0x01][0x02][CRC_H][CRC_L][0x16]
 ```
 
-- 长度 = 8（无数据）
+- 长度 = 12（无数据）
+- 地址 = 0x00000001
 - SEQ = 1
 - DESC = 0x02（响应，下行）
 
 ### 有数据帧
 
 ```
-[0x68][0x00][0x0F][0x02][0x01][0x01][0x00][0x01][0x00][0x01][0xFF][CRC_H][CRC_L][0x16]
+[0x68][0x00][0x13][0x00][0x00][0x00][0x01][0x02][0x01][0x01][0x00][0x01][0x00][0x01][0xFF][CRC_H][CRC_L][0x16]
 ```
 
-- 长度 = 15（数据7字节）
+- 长度 = 19（数据7字节）
+- 地址 = 0x00000001
 - SEQ = 2
 - DESC = 0x01（请求，上行）
 - meta_count = 1

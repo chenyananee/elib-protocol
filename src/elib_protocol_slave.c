@@ -6,7 +6,7 @@ elib_protocol_err_t elib_protocol_slave_init(elib_protocol_slave_ctx_t *ctx,
                                               const elib_protocol_bufs_t *bufs,
                                               const elib_protocol_slave_cfg_t *cfg)
 {
-    if (!ctx || !ops || !bufs || !cfg) {
+    if (!ctx || !ops || !bufs || !cfg || !cfg->addr) {
         return ELIB_PROTOCOL_ERR_INVALID_PARAM;
     }
 
@@ -15,6 +15,7 @@ elib_protocol_err_t elib_protocol_slave_init(elib_protocol_slave_ctx_t *ctx,
     ctx->tick_ms     = 0;
     ctx->timeout_cfg = cfg->timeout_ms;
     ctx->prev_rx_len = 0;
+    memcpy(ctx->self_addr, cfg->addr, 4);
     elib_protocol_ctx_init(ctx);
 
     return ELIB_PROTOCOL_OK;

@@ -200,6 +200,7 @@ void elib_protocol_ctx_init(elib_protocol_ctx_t *ctx)
     ctx->parse_rx_cnt = 0;
     memset(ctx->parse_addr, 0, 4);
     ctx->frame_pos    = 0;
+    memset(ctx->self_addr, 0, 4);
 }
 
 elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
@@ -246,10 +247,21 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
             ctx->parse_rx_cnt = p.rx_cnt;
             memcpy(ctx->parse_addr, p.addr, 4);
 
-            if (ctx->parse_state == ELIB_PROTOCOL_STATE_SEQ &&
-                ctx->frame_pos + ctx->parse_length > ctx->bufs.rx_frame_buf_size) {
-                ctx->parse_state = ELIB_PROTOCOL_STATE_IDLE;
-                continue;
+            if (ctx->parse_state == ELIB_PROTOCOL_STATE_SEQ) {
+                if (ctx->frame_pos + ctx->parse_length > ctx->bufs.rx_frame_buf_size) {
+                    ctx->parse_state = ELIB_PROTOCOL_STATE_IDLE;
+                    continue;
+                }
+
+                uint8_t is_broadcast = (ctx->parse_addr[0] == 0xFF &&
+                                        ctx->parse_addr[1] == 0xFF &&
+                                        ctx->parse_addr[2] == 0xFF &&
+                                        ctx->parse_addr[3] == 0xFF);
+                if (!is_broadcast &&
+                    memcmp(ctx->parse_addr, ctx->self_addr, 4) != 0) {
+                    ctx->parse_state = ELIB_PROTOCOL_STATE_IDLE;
+                    continue;
+                }
             }
 
             if (err == ELIB_PROTOCOL_OK) {

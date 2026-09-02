@@ -173,6 +173,14 @@ if (consumed > 0) {
 ### 从机端初始化
 
 ```c
+uint8_t slave_addr[4] = {0x00, 0x00, 0x00, 0x01};  // 从机地址
+
+elib_protocol_slave_cfg_t cfg = {
+    .polling_interval_ms = 10,
+    .timeout_ms = 100,
+    .addr = slave_addr
+};
+
 elib_protocol_slave_ctx_t slave;
 elib_protocol_slave_init(&slave, &ops, &bufs, &cfg);
 ```

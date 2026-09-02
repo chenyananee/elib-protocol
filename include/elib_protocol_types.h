@@ -78,6 +78,8 @@ typedef struct {
     uint8_t                    parse_seq;
     uint8_t                    parse_desc;
     size_t                     frame_pos;
+    /* self address (for slave filtering) */
+    uint8_t                    self_addr[4];
 } elib_protocol_ctx_t;
 
 /**
@@ -104,6 +106,7 @@ typedef elib_protocol_ctx_t elib_protocol_slave_ctx_t;
 typedef struct {
     uint32_t polling_interval_ms;
     uint32_t timeout_ms;
+    const uint8_t *addr;
 } elib_protocol_slave_cfg_t;
 
 #ifdef __cplusplus

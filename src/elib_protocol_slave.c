@@ -1,6 +1,8 @@
 #include "../include/elib_protocol.h"
 #include "elib_protocol_core.h"
 
+#include <string.h>
+
 elib_protocol_err_t elib_protocol_slave_init(elib_protocol_slave_ctx_t *ctx,
                                               const elib_protocol_ops_t *ops,
                                               const elib_protocol_bufs_t *bufs,

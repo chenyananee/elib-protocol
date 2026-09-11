@@ -292,6 +292,9 @@ elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
             ctx->tick_ms     = 0;
             ctx->prev_rx_len = 0;
             elib_protocol_ctx_init(ctx);
+        }
+    }
+
     return ELIB_PROTOCOL_OK;
 }
 
@@ -322,7 +325,7 @@ size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
                                 uint16_t id, uint8_t type,
                                 const void *data, uint16_t len)
 {
-    if (!buf || buf_size < 5 + len) {
+    if (!buf || buf_size < (size_t)(5 + len)) {
         return 0;
     }
 
@@ -345,7 +348,6 @@ size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset)
         return 0;
     }
 
-    size_t data_len = offset - ELIB_PROTOCOL_FRAME_OVERHEAD;
     size_t frame_len = offset;
     buf[1] = (frame_len >> 8) & 0xFF;
     buf[2] = frame_len & 0xFF;
@@ -366,8 +368,4 @@ size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset)
     buf[frame_len - 1] = ELIB_PROTOCOL_FRAME_TAIL;
 
     return frame_len;
-}
-    }
-
-    return ELIB_PROTOCOL_OK;
 }

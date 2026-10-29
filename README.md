@@ -1,365 +1,305 @@
 # elib-protocol
 
-## 简介
+轻量级主从（master/slave）总线协议 —— C99、零动态内存、零全局状态、时间零感知。
 
-elib-protocol是一个轻量级嵌入式通信协议库，专为主从架构设计。
+主机与从机是真分离的两个角色（各自的 ctx 与 API），共享同一个流式解析引擎。
+字节流式喂入，完整帧通过回调浮出。适用于 UART / RS485 / RS232 等任意
+字节流物理层，**不附带任何驱动**——收发由你自己的 BSP 完成，本库只管协议本身。
 
 ## 特性
 
-- 零平台依赖、零动态内存、零文件修改
-- 主从双角色，同一套代码
-- CRC16校验，序列号支持帧匹配
-- 元数据ID机制，灵活扩展
-
----
+- **帧格式严格定长前缀**：一眼定位全帧长度，接收端永不解析无效字节
+- **流式接收**：每个字节恰好喂一次，无重扫、无回看、无 consumed 账本
+- **CRC 增量计算**：随字节流逐字节累计，无二次回扫
+- **防淤积四重防护**：任何脏数据流下接收器都有界收敛，永不卡死
+- **真多实例**：全部状态在 ctx 里，回调带 `user_data`，库中无任何全局变量
+- **配置端序**：全库线缆字节序默认大端，`-D` 一个宏整体翻转为小端
+- **全套类型读写助手**：u8/u16/u32/u64/i8/i16/i32/i64/bool，逐字节移位实现，
+  与机器端序无关、无对齐炸弹
+- **断流检测归用户**：库对时间零感知，`reset()` 任何时机可调
+- **零动态内存**：ctx 与重组缓冲均由用户静态分配
 
 ## 帧格式
 
 ```
-[0x68] [LEN_H] [LEN_L] [ADDR0] [ADDR1] [ADDR2] [ADDR3] [SEQ] [DESC] [DATA...] [CRC_H] [CRC_L] [0x16]
+0x68 | LEN_H LEN_L | ADDR0 ADDR1 ADDR2 ADDR3 | SEQ | DESC | DATA ... | CRC_H CRC_L | 0x16
 ```
 
-### 帧头（0x68）
-
-固定值 `0x68`，标识帧起始。
-
-### 帧长度（LEN）
-
-2字节，大端序，表示整个帧的长度（包含帧头和帧尾）。
-
-- 最小帧长：12字节（无数据）
-- 最大帧长：由缓冲区大小决定
-
-### 从机地址（ADDR）
-
-4字节，大端序，用于多机通信识别。
-
-| 地址 | 用途 |
-|------|------|
-| 0x00000000 | 中央主机 |
-| 0x00000001 ~ 0xFFFFFFFE | 从机地址（从1开始编址） |
-| 0xFFFFFFFF | 广播地址（所有从机接收） |
-
-- 主机发送请求时，指定目标从机地址
-- 从机响应或主动上报时，携带自身地址
-- 广播地址时，所有从机接收处理
-
-### 序列号（SEQ）
-
-1字节，范围 0-255，循环使用。
-
-- 用于帧匹配和去重
-- 请求和响应使用相同序列号
-
-### 描述符（DESC）
-
-1字节，按位定义帧属性。
-
-```
-bit7  bit6  bit5  bit4  bit3  bit2  bit1  bit0
-  0     0     0     0    FRAG  TYPE1 TYPE0  DIR
-```
-
-| 位 | 名称 | 说明 |
-|----|------|------|
-| bit0 | DIR | 方向：0=下行(host→slave)，1=上行(slave→host) |
-| bit1-2 | TYPE | 类型：00=请求，01=响应，10=事件 |
-| bit3 | FRAG | 分片：0=无分片，1=有分片 |
-| bit4-7 | 保留 | 固定为0 |
-
-#### 方向（DIR）
-
-- 下行帧：主机发送，从机接收
-- 上行帧：从机发送，主机接收
-
-#### 类型（TYPE）
-
-- 00：请求帧（Request）- 主机发起请求
-- 01：响应帧（Response）- 从机响应请求
-- 10：事件帧（Event）- 从机主动上报
-
-### 数据单元（DATA）
-
-可变长度，包含一个或多个元数据条目。
-
-#### 数据单元格式
-
-```
-[meta_count] [ID_H] [ID_L] [TYPE] [LEN_H] [LEN_L] [fdata...] ...
-```
-
-#### 元数据计数（meta_count）
-
-1字节，表示数据单元中元数据条目的数量。
-
-#### 元数据条目
-
-每个元数据条目包含：
-
-| 字段 | 长度 | 说明 |
+| 字段 | 大小 | 说明 |
 |------|------|------|
-| ID | 2字节 | 数据ID（主键，大端序） |
-| TYPE | 1字节 | 数据类型 |
-| LEN | 2字节 | 数据长度（大端序） |
-| fdata | LEN字节 | 数据内容 |
+| HEAD | 1 | 固定 `0x68` |
+| LEN  | 2 | **全帧字节数**（含头尾 12B 开销），最小 12，按配置端序 |
+| ADDR | 4 | 目标站地址，按配置端序；`0xFFFFFFFF` = 广播 |
+| SEQ  | 1 | 序号，回环不透明（请求-响应关联由应用层自查） |
+| DESC | 1 | 描述字，位域见下 |
+| DATA | ≥1 | 元数据区：`meta_count` + N × 条目（见下） |
+| CRC  | 2 | CRC16/CCITT-FALSE（poly `0x1021`，初值 `0xFFFF`），覆盖从头到数据末（`[0, LEN-3)`），不含 CRC 域与帧尾，按配置端序 |
+| TAIL | 1 | 固定 `0x16`，**不做转义**（见"鲁棒性承诺"） |
 
-#### 数据ID（ID）
+**DESC 位域**：
 
-2字节，大端序，用户自定义的标识符。
-
-- ID是解析数据的主要依据
-- 用户根据ID识别数据内容
-
-#### 数据类型（TYPE）
-
-1字节，标识数据格式。
-
-| 值 | 类型 | 说明 |
-|----|------|------|
-| 0 | uint8 | 无符号8位整数 |
-| 1 | uint16 | 无符号16位整数 |
-| 2 | uint32 | 无符号32位整数 |
-| 3 | uint64 | 无符号64位整数 |
-| 4 | int8 | 有符号8位整数 |
-| 5 | int16 | 有符号16位整数 |
-| 6 | int32 | 有符号32位整数 |
-| 7 | int64 | 有符号64位整数 |
-| 8 | bool | 布尔值 |
-| 9 | array | 字节数组 |
-
-TYPE仅作为辅助参考，用户主要根据ID解析数据。
-
-#### 数据长度（LEN）
-
-2字节，大端序，表示后续fdata的字节数。
-
-#### 数据内容（fdata）
-
-LEN字节，实际数据。
-
-### CRC校验（CRC）
-
-2字节，大端序，CRC16/CCITT校验值。
-
-- 多项式：0x1021
-- 初始值：0xFFFF
-- 校验范围：从帧头0x68到最后一个数据字节（不含CRC和帧尾）
-
-### 帧尾（0x16）
-
-固定值 `0x16`，标识帧结束。
-
----
-
-## 字节序转换
-
-协议帧头（LEN、ADDR、SEQ、DESC、CRC）使用大端序，但**元数据（ID、TYPE、LEN、fdata）没有规定字节序**。
-
-- 如果主机和从机都是小端机器（如ARM Cortex-M）：直接读写即可
-- 如果主机和从机大小端不一致：需要使用转换函数
-
-```c
-uint16_t elib_protocol_swap16(uint16_t val);
-uint32_t elib_protocol_swap32(uint32_t val);
-uint64_t elib_protocol_swap64(uint64_t val);
+```
+bit0      : DIR   0=下行（主机→从机） 1=上行（从机→主机）
+bit1..2   : TYPE  0x00=REQ  0x02=RESP  0x04=EVENT
+bit3      : FRAG  0x00=整帧 0x08=分片
+其余位    : 保留，置 0
 ```
 
-## 错误处理
+现成组合宏：`ELIB_PROTOCOL_DESC_REQ_DOWN` / `DESC_RESP_UP` / `DESC_EVENT_UP`。
 
-### 无效帧
+**DATA 区（元数据列表）**：
 
-- 帧长度 < 12：帧过短，丢弃
-- 帧尾 ≠ 0x16：帧尾错误，丢弃
-- CRC不匹配：校验错误，丢弃
+```
+meta_count(1) + N × [ ID(2) | TYPE(1) | LEN(2) | fdata(LEN) ]
+```
 
-### 超时
+- `meta_count`：条目数（1 字节，≤255）
+- `ID`：应用自定义的键，按配置端序
+- `TYPE`：建议性载荷类型（`elib_protocol_data_type_t`，ARRAY `0x09` 为裸字节串）
+- `LEN`：fdata 字节数，按配置端序
+- `fdata`：原始载荷字节；数值解析一律走端序助手
 
-帧接收过程中，若数据长度长时间不变，触发超时。超时后丢弃当前帧，重置解析状态。
+帧内所有数值字段（LEN/ADDR/meta ID/meta LEN/CRC/fdata 数值）全部按**配置端序**
+解释，且由助手统一读写。
 
-### 缓冲区溢出
+## 端序配置
 
-帧长度超过缓冲区大小时，拒绝该帧。
+```c
+/* 默认：ELIB_PROTOCOL_ORDER_BIG —— 全库按大端解线缆字节 */
+/* 翻转：编译时加 -DELIB_PROTOCOL_ORDER_LITTLE */
+```
 
----
+- 总线两端必须一致：要么都默认，要么都加 `-D` 翻转
+- 头文件用 `__BYTE_ORDER__` 检测机器端序并导出
+  `ELIB_PROTOCOL_MACHINE_BIG/LITTLE`（检测不到默认大端，可 `-D` 覆盖），
+  仅供用户代码判断自身
+- **助手不依赖机器端序**：`get/put` 系列按配置端序逐字节移位，任何平台结果
+  一致，天然无对齐问题（指针可指向任意奇偶偏移）
 
-# 主机端使用
+助手清单：`elib_protocol_get/put_u8 u16 u32 u64 i8 i16 i32 i64 bool`
+（bool 为 1 字节，0 或 1），另有 `swap16/32/64` 纯值交换器。
 
-## 主机端初始化
+## 快速上手
+
+### 1. 声明与初始化（零动态内存）
 
 ```c
 #include "elib_protocol.h"
 
-// 定义接收缓冲区
-static uint8_t rx_buf[256];
+#define FRAME_MAX 64u
 
-// 定义回调函数：当收到从机数据时调用
-static void on_frame(const elib_protocol_frame_ctx_t *ctx) {
-    // ctx->addr:    从机地址（4字节）
-    // ctx->seq:     序列号
-    // ctx->desc:    描述符
-    // ctx->data:    数据指针
-    // ctx->data_len: 数据长度
-}
+static uint8_t rx_buf[FRAME_MAX];                    /* 帧重组缓冲 */
 
-// 初始化主机
-elib_protocol_ops_t ops = { .on_frame = on_frame };
-elib_protocol_bufs_t bufs = {
-    .rx_frame_buf = rx_buf,
-    .rx_frame_buf_size = sizeof(rx_buf)
-};
-elib_protocol_host_cfg_t cfg = {
-    .timeout_ms = 100
-};
+static void on_frame(void *ud, const elib_protocol_frame_ctx_t *f) {
+    (void)ud;
+    uint16_t pos = 0;
+    elib_protocol_meta_t m;
 
-elib_protocol_ctx_t host;
-elib_protocol_host_init(&host, &ops, &bufs, &cfg);
-```
-
-## 主机端主循环处理
-
-```c
-// 在主循环中调用，传入接收数据和长度
-size_t consumed = 0;
-elib_protocol_host_process(&host, dt_ms, rx_len, &consumed);
-
-// 消费已处理的数据
-if (consumed > 0) {
-    memmove(rx_buf, rx_buf + consumed, rx_len - consumed);
-    rx_len -= consumed;
-}
-```
-
-## 主机端组包发送
-
-```c
-uint8_t tx_buf[128];
-uint8_t slave_addr[4] = {0x00, 0x00, 0x00, 0x01};  // 目标从机地址
-uint8_t val = 0xFF;
-
-// 1. 生成帧头
-size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), slave_addr, seq, desc);
-
-// 2. 添加元数据（可多次调用）
-offset += elib_protocol_build_meta(tx_buf + offset, sizeof(tx_buf) - offset,
-                                   0x0001, ELIB_PROTOCOL_DATA_U8, &val, 1);
-
-// 3. 打包完成帧
-size_t frame_len = elib_protocol_build_pack(tx_buf, sizeof(tx_buf), offset);
-
-// 4. 发送
-send(tx_buf, frame_len);
-```
-
-## 主机端解包数据
-
-```c
-static void on_frame(const elib_protocol_frame_ctx_t *ctx) {
-    size_t pos = 0;
-    elib_protocol_meta_t *meta;
-
-    while (elib_protocol_get_next_meta(&pos, ctx->data, ctx->data_len, &meta) == ELIB_PROTOCOL_OK) {
-        switch (meta->id) {
-        case 0x0001:  // 温度
-            float temp = *(float *)meta->fdata;
+    while (elib_protocol_get_next_meta(&pos, f->data, f->data_len, &m)
+           == ELIB_PROTOCOL_OK) {
+        switch (m.id) {
+        case 0x0001:  /* u32 温度 */
+            if (m.type == ELIB_PROTOCOL_DATA_U32 && m.len == 4u) {
+                uint32_t temp = elib_protocol_get_u32(m.fdata);
+                /* ... */
+            }
             break;
-        case 0x0002:  // 湿度
-            uint16_t humidity = (meta->fdata[0] << 8) | meta->fdata[1];
+        default:
             break;
         }
+    }
+    /* f->data 指向重组缓冲，回调返回即失效；要长期持有请自行拷贝 */
+}
+
+/* ---- 从机 ---- */
+static const uint8_t SELF_ADDR[4] = { 0x00, 0x00, 0x00, 0x01 };
+
+static elib_protocol_slave_ctx_t slave;
+
+void slave_setup(void) {
+    static const elib_protocol_ops_t ops = { NULL, on_frame };
+    static const elib_protocol_bufs_t bufs = { rx_buf, FRAME_MAX };
+    static const elib_protocol_slave_cfg_t cfg = { SELF_ADDR };
+
+    (void)elib_protocol_slave_init(&slave, &ops, &bufs, &cfg);
+}
+```
+
+```c
+/* ---- 主机（无自地址：一切上行帧全收） ---- */
+static elib_protocol_host_ctx_t host;
+
+void host_setup(void) {
+    static const elib_protocol_ops_t ops = { NULL, on_frame };
+    static const elib_protocol_bufs_t bufs = { rx_buf, FRAME_MAX };
+
+    (void)elib_protocol_host_init(&host, &ops, &bufs);
+}
+```
+
+### 2. 收：把收到的字节喂进来（驱动无关）
+
+```c
+/* UART RX 中断/DMA/轮询里拿到 n 字节 */
+void uart_on_rx(const uint8_t *bytes, uint16_t n) {
+    elib_protocol_slave_feed(&slave, bytes, n);
+    /* 返回值 = 本批最后一个被弃帧的丢弃原因（无弃帧则 OK）；
+     * 所有喂入的字节恒定全部消费 */
+}
+
+/* 或逐字节（内部与批量同一路径） */
+void uart_on_rx_byte(uint8_t b) {
+    (void)elib_protocol_slave_feed_byte(&slave, b);
+}
+```
+
+### 3. 发：组帧三段式
+
+```c
+uint8_t tx[64];
+size_t  off;
+uint8_t temp_buf[4];
+
+elib_protocol_put_u32(temp_buf, 2580u);   /* 数值过线必走助手 */
+
+off = elib_protocol_build_header(tx, sizeof(tx), SELF_ADDR /* NULL=广播 */,
+                                 seq++, ELIB_PROTOCOL_DESC_REQ_DOWN);
+off += elib_protocol_build_meta(tx + off, sizeof(tx) - off,
+                                0x0001u, ELIB_PROTOCOL_DATA_U32,
+                                temp_buf, 4u);
+off += elib_protocol_build_meta(tx + off, sizeof(tx) - off,
+                                0x0002u, ELIB_PROTOCOL_DATA_ARRAY, NULL, 0u);
+{
+    size_t frame_len = elib_protocol_build_pack(tx, sizeof(tx), off);
+    if (frame_len != 0u) {
+        uart_send(tx, (uint16_t)frame_len);   /* 你的物理层 */
     }
 }
 ```
 
----
+三段式说明：
 
-# 从机端使用
+- `build_header` 写入 10 字节（头 + LEN 占位 + 地址 + SEQ + DESC + meta_count 占位），返回 10
+- `build_meta` 在写入位置追加一条元数据（ID/TYPE/LEN/载荷），返回新写入位置；`data` 为 NULL 仅允许 `len==0`
+- `build_pack` 回扫元数据区填 meta_count/全帧长/CRC/帧尾，**元数据区必须被条目严格铺满**（每条 5+len 且无剩余），否则返回 0 拒绝封帧——坏帧出不了炉
 
-## 从机端初始化
+### 4. 断流检测（完全归用户）
 
-```c
-#include "elib_protocol.h"
-
-// 定义接收缓冲区
-static uint8_t rx_buf[256];
-
-// 定义回调函数：当收到主机数据时调用
-static void on_frame(const elib_protocol_frame_ctx_t *ctx) {
-    // ctx->addr:    主机地址（广播时为0xFFFFFFFF）
-    // ctx->seq:     序列号
-    // ctx->desc:    描述符
-    // ctx->data:    数据指针
-    // ctx->data_len: 数据长度
-}
-
-// 本机地址（从1开始编址）
-uint8_t self_addr[4] = {0x00, 0x00, 0x00, 0x01};
-
-// 初始化从机
-elib_protocol_ops_t ops = { .on_frame = on_frame };
-elib_protocol_bufs_t bufs = {
-    .rx_frame_buf = rx_buf,
-    .rx_frame_buf_size = sizeof(rx_buf)
-};
-elib_protocol_slave_cfg_t cfg = {
-    .timeout_ms = 100,
-    .addr = self_addr
-};
-
-elib_protocol_ctx_t slave;
-elib_protocol_slave_init(&slave, &ops, &bufs, &cfg);
-```
-
-## 从机端主循环处理
+库不管理时间。你的流断策略（空闲超时、看门狗、链路状态……）自行触发：
 
 ```c
-// 在主循环中调用，传入接收数据和长度
-size_t consumed = 0;
-elib_protocol_slave_process(&slave, dt_ms, rx_len, &consumed);
-
-// 消费已处理的数据
-if (consumed > 0) {
-    memmove(rx_buf, rx_buf + consumed, rx_len - consumed);
-    rx_len -= consumed;
-}
+/* 任何时机可调：清零全部解析状态，回到"猎头"态 */
+(void)elib_protocol_slave_reset(&slave);
 ```
 
-## 从机端组包发送
+推荐模式：记录"距上次收到任意字节的时长"，超过阈值即 `reset()`——半截帧、
+弃帧配额、吞字节计数一并清空，下一帧干净起步。
+
+## 错误码
+
+| 错误码 | 含义 |
+|--------|------|
+| `OK` | 成功 |
+| `INVALID_PARAM` | init/喂入参数非法（NULL、批量 feed 的 bytes==NULL 且 len!=0） |
+| `NOT_INITIALIZED` | 未 init 就调用 |
+| `BUFFER_TOO_SMALL` | 组帧：输出缓冲不够（builder 返回 0） |
+| `CHECKSUM` | 收：CRC 不符，整帧弃 |
+| `FRAME` | 收：坏帧（帧尾错误）；组帧：元数据回扫不合规，拒绝封帧 |
+| `BUSY` | on_frame 回调执行期间重入 feed/reset |
+
+`feed` 批量返回值 = **本批最后一个被弃帧的丢弃原因**；单帧被地址过滤属多机常态，
+不计为弃帧。喂入的字节无论如何全部消费。
+
+## 接收管线
+
+```
+IDLE      : 等 0x68（垃圾字节直接丢弃，不进缓冲；命中 → 存头）
+LEN_H/L   : LEN 两字节到手即核：
+            ├ < 12（假 LEN）  → 丢弃这 3 字节，回 IDLE 等头部之后最近的 0x68
+            ├ > 缓冲（超大）  → SWALLOW 吞掉余下定额，回 IDLE
+            └ 合法            → 继续装帧，缓冲溢出结构性不可能
+ADDR0..3  : 存 4 字节；从机收满即过滤（本机/广播才放行，其余静默吞噬余下定额；
+            主机无自地址 → 全收）
+SEQ/DESC  : 存；DESC 后若数据为空（LEN==12）→ 直接进 CRC
+DATA      : 存字节并增量累计 running CRC；数据区 0x68 是普通载荷，绝不重搜
+CRC_H/L   : 存入（计入帧缓冲，不计入 running CRC）
+TAIL      : ≠ 0x16 →FRAME 弃帧；CRC 不符 →CHECKSUM 弃帧；
+            均过 → on_frame(user_data, frame) → 复位回 IDLE 接下一帧
+SWALLOW   : 计数递减到 0 回 IDLE；期间字节一律不解读
+```
+
+## 鲁棒性承诺
+
+**防淤积四重防护：**
+
+1. **缓冲溢出结构性不可能**——缓冲只装"经 LEN 认证"的帧段，LEN 先核后装
+2. **脏数据定额收敛**——弃帧一律按已知定额丢弃：假 LEN 丢 3 字节即刻回头、
+   真弃帧/地址过滤吞完余下配额严格回 IDLE；期满后只在**真实** 0x68 处重同步
+3. **断流检测归用户**——`reset()` 任何时机可调，把一切中态清空
+4. **回调重入闸**——on_frame 执行期间任何 feed/reset 返回 `BUSY`
+
+**错位碰撞的有界代价**（连续流丢字节导致错位时）：每次碰撞最多损失
+"旧帧剩余配额 + 一个伪头 3 字节"，CRC 必裁一切误拼，IDLE 严格重同步，
+**永不卡死**。
+
+**为什么不做转义**：帧格式定长前缀 + LEN 一眼定位，无需转义即可保证正确性；
+转义/COBS 引入成对代价（带宽、实现复杂度），收益为零。载荷 `fdata` 含 `0x68`
+是合法数据，接收端在 DATA 态绝不重搜帧头。
+
+## 多实例
+
+全部状态（解析状态机、CRC、缓冲游标、吞字节定额、重入闸）都在 ctx 里；
+回调经 `ops.user_data` 原样注入使用方上下文。多路 UART 各自一对
+ctx + 缓冲 + ops 即可，互不干扰，库内无任何全局/静态可变状态。
 
 ```c
-uint8_t tx_buf[128];
-uint8_t self_addr[4] = {0x00, 0x00, 0x00, 0x01};  // 自身地址
-uint8_t val = 0xAA;
-
-// 1. 生成帧头
-size_t offset = elib_protocol_build_header(tx_buf, sizeof(tx_buf), self_addr, seq, desc);
-
-// 2. 添加元数据（可多次调用）
-offset += elib_protocol_build_meta(tx_buf + offset, sizeof(tx_buf) - offset,
-                                   0x0001, ELIB_PROTOCOL_DATA_U8, &val, 1);
-
-// 3. 打包完成帧
-size_t frame_len = elib_protocol_build_pack(tx_buf, sizeof(tx_buf), offset);
-
-// 4. 发送
-send(tx_buf, frame_len);
+static elib_protocol_host_ctx_t  host_uart1;
+static elib_protocol_host_ctx_t  host_uart2;   /* 再来一路，一样用 */
 ```
 
-## 从机端解包数据
+## 重组缓冲与回调语义
 
-```c
-static void on_frame(const elib_protocol_frame_ctx_t *ctx) {
-    size_t pos = 0;
-    elib_protocol_meta_t *meta;
+- `bufs.frame_buf` 是用户预分配的**帧重组缓冲**，尺寸 ≥ 单帧最大长度
+- 回调期间缓冲被库冻结：`frame->data` 指向缓冲内 DATA 区
+  （首字节 = meta_count），`data_len` 含 meta_count 字节
+- 回调返回即刻复位服役下一帧——要长期持有数据请回调内自行拷贝，
+  现用现取则零拷贝
+- `frame->addr/seq/desc`：地址四字节、序号、描述字已抠出
 
-    while (elib_protocol_get_next_meta(&pos, ctx->data, ctx->data_len, &meta) == ELIB_PROTOCOL_OK) {
-        switch (meta->id) {
-        case 0x0001:  // 控制指令
-            uint8_t cmd = meta->fdata[0];
-            break;
-        case 0x0002:  // 参数设置
-            uint16_t param = (meta->fdata[0] << 8) | meta->fdata[1];
-            break;
-        }
-    }
-}
+## 移植指南
+
+- **语言标准**：C99；仅依赖 `<stdint.h> <stddef.h> <string.h>`
+- **无动态内存、无递归、无全局可变状态**：所有对象用户分配
+- **无 ISR 特殊形态**：中断里逐字节 `*_feed_byte`，或攒批 `*_feed`
+  （返回值语义只有弃帧报告，不影响消费——字节恒定全部吃掉）
+- **无需对齐处理**：读帧数据请全部走 `elib_protocol_get_*` 助手，
+  指针可指向任意偏移；**不要**对 `fdata` 做结构体 overlay（端序与对齐都不可移植）
+- **线缆端序协商**：两端同一宏取值；从机地址主机下发的 LEN/ADDR/CRC
+  全部随库端序走，无逐字段的例外
+- **可裁剪**：只用主机则不编译 slave.c，反之亦然
+
+## 目录
+
 ```
+include/elib_protocol.h     唯一公共头（端序/助手/类型/API）
+src/elib_protocol_core.h/.c 引擎（解析状态机 + 增量 CRC + 重组）、组帧、迭代器
+src/elib_protocol_host.c    主机角色（薄）
+src/elib_protocol_slave.c   从机角色（薄，加地址过滤）
+test/test_elib_protocol.c   roundtrip + 鲁棒性测试集
+```
+
+构建（示例 -Werror 一等构造）：
+
+```
+arm-none-eabi-gcc -std=c99 -Wall -Wextra -Werror -Iinclude -c src/elib_protocol_core.c
+arm-none-eabi-gcc -std=c99 -Wall -Wextra -Werror -Iinclude -c src/elib_protocol_host.c
+arm-none-eabi-gcc -std=c99 -Wall -Wextra -Werror -Iinclude -c src/elib_protocol_slave.c
+arm-none-eabi-gcc -std=c99 -Wall -Wextra -Werror -Iinclude -c test/test_elib_protocol.c
+```
+
+## 与 v1 的关系
+
+线缆帧格式与 v1 完全一致（互不破坏既有对端）；API 为 v2 全新重构，
+不兼容 v1 旧头文件（`types.h`/`err.h` 已并入单头伞）。v2 修复了 v1
+接收路径的三处灾难级缺陷（CRC 断值持久化缺失、全缓冲重扫污染中态帧、
+元数据端序按本机 overlay）并删除全部时间相关参数（断流检测归用户）。

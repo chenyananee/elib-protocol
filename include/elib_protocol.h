@@ -291,10 +291,24 @@ typedef struct {
     uint16_t       data_len; /* includes the meta_count byte */
 } elib_protocol_frame_ctx_t;
 
+/* custom checksum hook (16-bit): called ONCE per candidate frame with
+ * the whole CRC coverage region [head .. data end] straight out of the
+ * reassembly buffer, so a hardware CRC peripheral can be driven in a
+ * single block pass. Returns the 16-bit value to compare against the
+ * on-wire CRC field (read back in the configured wire order).
+ * NULL in ops selects the built-in software CRC16/CCITT-FALSE.
+ * Both ends of a link MUST agree on the algorithm. */
+typedef uint16_t (*elib_protocol_crc_fn)(void *ud, const uint8_t *data,
+                                         size_t len);
+
+/* the built-in software checksum (also the ops->crc NULL fallback) */
+uint16_t elib_protocol_crc16(const uint8_t *data, size_t len);
+
 /* user callbacks (user_data forwarded untouched - no globals needed) */
 typedef struct {
     void *user_data;
     void (*on_frame)(void *ud, const elib_protocol_frame_ctx_t *frame);
+    elib_protocol_crc_fn crc;  /* NULL = built-in software CRC */
 } elib_protocol_ops_t;
 
 /* user-provided static reassembly buffer (>= largest expected frame) */
@@ -312,12 +326,12 @@ typedef struct {
     uint16_t                   claim;      /* validated byte quota of frame */
     uint16_t                   filled;     /* bytes stored in frame_buf */
     uint16_t                   swallow;    /* pending ignored byte count */
-    uint16_t                   crc_run;    /* running CRC over stored bytes */
     uint16_t                   crc_rx;     /* CRC field being received */
     uint8_t                    state;
     struct {
         uint8_t initialized : 1;
         uint8_t busy        : 1; /* on_frame is in progress */
+        uint8_t crc_ok      : 1; /* frame checksum verified */
     } bit_flags;
 } elib_protocol_engine_t;    /* common engine; layout shared by both roles */
 
@@ -390,6 +404,16 @@ size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
 /* meta scan must land exactly on "offset" with well-formed entries or
  * the frame is refused (returns 0) - no half-crafted frames out */
 size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset);
+
+/* Same three-step wrap-up, but checksummed with a caller-supplied
+ * function (e.g. a wrapper around a hardware CRC peripheral). When the
+ * receiving end is configured with ops->crc, the sending end MUST use
+ * this variant with the same function, or the peer will reject every
+ * frame as a checksum mismatch. Returns the full frame length, 0 on
+ * refusal. */
+size_t elib_protocol_build_pack_crc(uint8_t *buf, size_t buf_size,
+                                    size_t offset,
+                                    elib_protocol_crc_fn crc, void *ud);
 
 /* ---- metadata iterator over the frame DATA region ----
  *

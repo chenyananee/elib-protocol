@@ -38,14 +38,11 @@ uint16_t elib_protocol_crc16(const uint8_t *data, size_t len) {
     return crc;
 }
 
-static uint16_t crc16_step(uint16_t crc, uint8_t byte) {
-    uint16_t j;
-    crc ^= (uint16_t)byte << 8;
-    for (j = 0; j < 8; j++) {
-        crc = (crc & 0x8000u) ? (uint16_t)(crc << 1) ^ CRC_POLY
-                              : (uint16_t)(crc << 1);
-    }
-    return crc;
+/* ops->crc NULL fallback: the built-in software algorithm, shaped as
+ * an elib_protocol_crc_fn (user data ignored) */
+static uint16_t crc16_software(void *ud, const uint8_t *data, size_t len) {
+    (void)ud;
+    return elib_protocol_crc16(data, len);
 }
 
 /* ---- engine lifecycle ---- */
@@ -61,9 +58,9 @@ void elib_protocol_engine_init(elib_protocol_engine_t *e,
     e->claim = 0;
     e->filled = 0;
     e->swallow = 0;
-    e->crc_run = CRC_INIT;
     e->crc_rx = 0;
     e->bit_flags.initialized = 1;
+    e->bit_flags.crc_ok = 0;
     e->bit_flags.busy = 0;
 }
 
@@ -72,18 +69,18 @@ void elib_protocol_engine_reset(elib_protocol_engine_t *e) {
     e->claim = 0;
     e->filled = 0;
     e->swallow = 0;
-    e->crc_run = CRC_INIT;
     e->crc_rx = 0;
     /* busy stays off: nothing inside a callback survives a reset */
     e->bit_flags.busy = 0;
+    e->bit_flags.crc_ok = 0;
 }
 
-/* store one byte into the reassembly buffer and fold it into the
- * running CRC (CRC field bytes and the tail must bypass the CRC fold) */
+/* store one byte into the reassembly buffer. The checksum is NOT
+ * accumulated byte by byte: the whole coverage region is buffered and
+ * verified in one call when the CRC field completes. */
 static void store(elib_protocol_engine_t *e, uint8_t byte) {
     e->bufs.frame_buf[e->filled] = byte;
     e->filled++;
-    e->crc_run = crc16_step(e->crc_run, byte);
 }
 
 static elib_protocol_err_t feed_one(elib_protocol_engine_t *e, uint8_t byte) {
@@ -94,8 +91,6 @@ static elib_protocol_err_t feed_one(elib_protocol_engine_t *e, uint8_t byte) {
         if (byte == (uint8_t)ELIB_PROTOCOL_FRAME_HEAD) {
             e->bufs.frame_buf[0] = byte;
             e->filled = 1;
-            /* the head itself is inside the CRC scope */
-            e->crc_run = crc16_step(CRC_INIT, byte);
             e->state = ELIB_PROTOCOL_STATE_LEN_H;
         }
         return ELIB_PROTOCOL_OK;
@@ -174,15 +169,25 @@ static elib_protocol_err_t feed_one(elib_protocol_engine_t *e, uint8_t byte) {
         return ELIB_PROTOCOL_OK;
 
     case ELIB_PROTOCOL_STATE_CRC_H:
-        e->bufs.frame_buf[e->filled++] = byte; /* not folded into CRC */
+        e->bufs.frame_buf[e->filled++] = byte; /* CRC field, not coverage */
         e->state = ELIB_PROTOCOL_STATE_CRC_L;
         return ELIB_PROTOCOL_OK;
 
-    case ELIB_PROTOCOL_STATE_CRC_L:
-        e->bufs.frame_buf[e->filled++] = byte; /* not folded into CRC */
+    case ELIB_PROTOCOL_STATE_CRC_L: {
+        const elib_protocol_crc_fn crc =
+            (e->ops->crc != NULL) ? e->ops->crc : crc16_software;
+
+        e->bufs.frame_buf[e->filled++] = byte;
         e->crc_rx = elib_protocol_get_u16(&e->bufs.frame_buf[e->claim - 3u]);
+        /* the frame is fully buffered by now (LEN was validated at
+         * LEN_L): one call spans [0, claim-3) = head .. data end,
+         * exactly the coverage region */
+        e->bit_flags.crc_ok =
+            (uint8_t)(crc(e->ops->user_data, e->bufs.frame_buf,
+                          (size_t)(e->claim - 3u)) == e->crc_rx);
         e->state = ELIB_PROTOCOL_STATE_TAIL;
         return ELIB_PROTOCOL_OK;
+    }
 
     case ELIB_PROTOCOL_STATE_TAIL: {
         elib_protocol_frame_ctx_t frame;
@@ -191,7 +196,7 @@ static elib_protocol_err_t feed_one(elib_protocol_engine_t *e, uint8_t byte) {
         if (byte != (uint8_t)ELIB_PROTOCOL_FRAME_TAIL) {
             return ELIB_PROTOCOL_ERR_FRAME;
         }
-        if (e->crc_rx != e->crc_run) {
+        if (!e->bit_flags.crc_ok) {
             return ELIB_PROTOCOL_ERR_CHECKSUM;
         }
 
@@ -298,13 +303,14 @@ size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
     return (size_t)5u + (size_t)len;
 }
 
-size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset) {
+/* shared wrap-up: validate/refuse, fill count/LEN, checksum, tail */
+static size_t build_pack_impl(uint8_t *buf, size_t buf_size, size_t offset,
+                              elib_protocol_crc_fn crc, void *ud) {
     size_t pos;
     size_t frame_len;
     uint8_t count = 0;
-    uint16_t crc;
 
-    if (buf == NULL || offset < 10u || offset > buf_size ||
+    if (buf == NULL || crc == NULL || offset < 10u || offset > buf_size ||
         buf_size - offset < 3u) {
         return 0;
     }
@@ -330,10 +336,19 @@ size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset) {
 
     elib_protocol_put_u8(&buf[9], count);
     elib_protocol_put_u16(&buf[1], (uint16_t)frame_len);
-    crc = elib_protocol_crc16(buf, offset);
-    elib_protocol_put_u16(&buf[offset], crc);
+    elib_protocol_put_u16(&buf[offset], crc(ud, buf, offset));
     buf[frame_len - 1u] = (uint8_t)ELIB_PROTOCOL_FRAME_TAIL;
     return frame_len;
+}
+
+size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset) {
+    return build_pack_impl(buf, buf_size, offset, crc16_software, NULL);
+}
+
+size_t elib_protocol_build_pack_crc(uint8_t *buf, size_t buf_size,
+                                    size_t offset,
+                                    elib_protocol_crc_fn crc, void *ud) {
+    return build_pack_impl(buf, buf_size, offset, crc, ud);
 }
 
 /* ---- metadata iterator ---- */

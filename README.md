@@ -10,7 +10,8 @@
 
 - **帧格式严格定长前缀**：一眼定位全帧长度，接收端永不解析无效字节
 - **流式接收**：每个字节恰好喂一次，无重扫、无回看、无 consumed 账本
-- **CRC 增量计算**：随字节流逐字节累计，无二次回扫
+- **校验可外挂**：自定义 16 位校验函数整段一次调用（硬件 CRC 外设直通），
+  ops.crc 不提供则内置软件 CRC16/CCITT-FALSE
 - **防淤积四重防护**：任何脏数据流下接收器都有界收敛，永不卡死
 - **真多实例**：全部状态在 ctx 里，回调带 `user_data`，库中无任何全局变量
 - **配置端序**：全库线缆字节序默认大端，`-D` 一个宏整体翻转为小端
@@ -33,7 +34,7 @@
 | SEQ  | 1 | 序号，回环不透明（请求-响应关联由应用层自查） |
 | DESC | 1 | 描述字，位域见下 |
 | DATA | ≥1 | 元数据区：`meta_count` + N × 条目（见下） |
-| CRC  | 2 | CRC16/CCITT-FALSE（poly `0x1021`，初值 `0xFFFF`），覆盖从头到数据末（`[0, LEN-3)`），不含 CRC 域与帧尾，按配置端序 |
+| CRC  | 2 | CRC16/CCITT-FALSE（poly `0x1021`，初值 `0xFFFF`）**默认算法，可外挂自定义**（见"自定义校验算法"），覆盖从头到数据末（`[0, LEN-3)`），不含 CRC 域与帧尾，按配置端序 |
 | TAIL | 1 | 固定 `0x16`，**不做转义**（见"鲁棒性承诺"） |
 
 **DESC 位域**：
@@ -117,7 +118,7 @@ static const uint8_t SELF_ADDR[4] = { 0x00, 0x00, 0x00, 0x01 };
 static elib_protocol_slave_ctx_t slave;
 
 void slave_setup(void) {
-    static const elib_protocol_ops_t ops = { NULL, on_frame };
+    static const elib_protocol_ops_t ops = { NULL, on_frame, NULL };
     static const elib_protocol_bufs_t bufs = { rx_buf, FRAME_MAX };
     static const elib_protocol_slave_cfg_t cfg = { SELF_ADDR };
 
@@ -130,7 +131,7 @@ void slave_setup(void) {
 static elib_protocol_host_ctx_t host;
 
 void host_setup(void) {
-    static const elib_protocol_ops_t ops = { NULL, on_frame };
+    static const elib_protocol_ops_t ops = { NULL, on_frame, NULL };
     static const elib_protocol_bufs_t bufs = { rx_buf, FRAME_MAX };
 
     (void)elib_protocol_host_init(&host, &ops, &bufs);
@@ -195,6 +196,51 @@ off += elib_protocol_build_meta(tx + off, sizeof(tx) - off,
 推荐模式：记录"距上次收到任意字节的时长"，超过阈值即 `reset()`——半截帧、
 弃帧配额、吞字节计数一并清空，下一帧干净起步。
 
+## 自定义校验算法（硬件 CRC 外设）
+
+默认使用内置软件 CRC16/CCITT-FALSE。若你的 MCU 带硬件 CRC 外设，
+在 `ops.crc` 里提供自定义函数，即可整段一次调用直通外设。
+
+自定义校验函数共一个形态，收发两侧必认：
+
+```c
+typedef uint16_t (*elib_protocol_crc_fn)(void *ud, const uint8_t *data,
+                                         size_t len);
+```
+
+约定：
+
+- **调用时机与切片**：每个候选帧的 CRC 域收满时，库对重组缓冲里的
+  覆盖区 `buf[0..LEN-3)`（帧头..数据末）**整段一次性调用**——帧此时必然
+  完整在缓冲内（LEN 已在 LEN_L 态核过容量），无需硬件外设担心 seed 跨字节携带
+- `ud` 透传 `ops.user_data`（多 CRC 单元或外设句柄场景用）
+- 须返回 16 位值，库按配置端序与线上 CRC 域比对；算法自含初值/多项式定义
+- 组帧侧用 `elib_protocol_build_pack_crc(buf, size, offset, crc, ud)` 封帧
+  （原 `build_pack` 恒走内置算法，签名不变，向后兼容）
+- 内置软件算法即公开的 `elib_protocol_crc16(data, len)`，你的自定义
+  实现里可直接复用（比如做位反变体或紧盯外设差异的对照探针）
+
+以 STM32 硬件 CRC 为例（伪代码示意）：
+
+```c
+static uint16_t hw_crc16(void *ud, const uint8_t *data, size_t len) {
+    CRC_HandleTypeDef *hcrc = ud;   /* 与 ops.user_data 对上 */
+
+    __HAL_CRC_DR_RESET(hcrc);      /* 外设复位（含初始值设置） */
+    for (size_t i = 0; i < len; i++) {
+        (void)HAL_CRC_Accumulate(hcrc, (uint32_t *)&data[i], 1); /* 或 DMA 一次整段 */
+    }
+    return (uint16_t)hcrc->Instance->DR;
+}
+
+static const elib_protocol_ops_t ops = { &hcrc, on_frame, hw_crc16 };
+```
+
+**红字：总线两端必须同算法。**收端配了自定义算法，发端就必须用
+`build_pack_crc` 带同一函数，否则每个帧都会被对面以 `CHECKSUM` 裁掉。
+发端忘记换变体是此功能唯一的高频踩坑点。多实例各自带各自的
+外设句柄（`user_data`），互不干扰。
+
 ## 错误码
 
 | 错误码 | 含义 |
@@ -221,8 +267,10 @@ LEN_H/L   : LEN 两字节到手即核：
 ADDR0..3  : 存 4 字节；从机收满即过滤（本机/广播才放行，其余静默吞噬余下定额；
             主机无自地址 → 全收）
 SEQ/DESC  : 存；DESC 后若数据为空（LEN==12）→ 直接进 CRC
-DATA      : 存字节并增量累计 running CRC；数据区 0x68 是普通载荷，绝不重搜
-CRC_H/L   : 存入（计入帧缓冲，不计入 running CRC）
+DATA      : 存字节；数据区 0x68 是普通载荷，绝不重搜
+CRC_H/L   : CRC 域存入后即对 buf[0..LEN-3)（头..数据末）整段
+            一次性调用校验函数（ops.crc 自定义或内置软件版）
+            → 得到期望值，TAIL 时与线缆域比对
 TAIL      : ≠ 0x16 →FRAME 弃帧；CRC 不符 →CHECKSUM 弃帧；
             均过 → on_frame(user_data, frame) → 复位回 IDLE 接下一帧
 SWALLOW   : 计数递减到 0 回 IDLE；期间字节一律不解读

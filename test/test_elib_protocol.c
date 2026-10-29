@@ -36,7 +36,29 @@ static void capture_cb(void *ud, const elib_protocol_frame_ctx_t *frame) {
     cap_count++;
 }
 
-static const elib_protocol_ops_t cap_ops = { NULL, capture_cb };
+static const elib_protocol_ops_t cap_ops = { NULL, capture_cb, NULL };
+
+/* ---- custom checksum hook ---- */
+
+static struct {
+    size_t  saw_len;
+    uint8_t saw_first;
+    uint8_t saw_last;
+} crc_probe;
+
+/* Deliberately different from the built-in algorithm: bit-inverted
+ * CRC16. Doubles as a geometry probe - it records the exact slice the
+ * engine hands over (which must be [0, frame_len-3) = head .. data
+ * end, straight out of the reassembly buffer). */
+static uint16_t inverted_crc16(void *ud, const uint8_t *data, size_t len) {
+    (void)ud;
+    crc_probe.saw_len = len;
+    crc_probe.saw_first = data[0];
+    crc_probe.saw_last = data[len - 1u];
+    return (uint16_t)~elib_protocol_crc16(data, len);
+}
+
+static const elib_protocol_ops_t crc_ops = { NULL, capture_cb, inverted_crc16 };
 
 static elib_protocol_host_ctx_t host;
 static elib_protocol_slave_ctx_t slave;
@@ -316,6 +338,50 @@ static void test_crc_and_tail_rejects(void) {
     printf("PASSED\n");
 }
 
+static void test_custom_checksum(void) {
+    uint16_t frame_len;
+    size_t off;
+    uint8_t tmp[4];
+
+    printf("Test: custom checksum hook (roundtrip, probe, mismatch)... ");
+
+    ctx_reset_all();
+    {
+        elib_protocol_bufs_t good = { host_buf, (uint16_t)sizeof(host_buf) };
+        assert(elib_protocol_host_init(&host, &crc_ops, &good)
+               == ELIB_PROTOCOL_OK);
+    }
+
+    /* same body as build_frame, but sealed with the custom function */
+    elib_protocol_put_u32(tmp, PAYLOAD_VALUE);
+    off = elib_protocol_build_header(tx, sizeof(tx), addr_own, 17u,
+                                     ELIB_PROTOCOL_DESC_REQ_DOWN);
+    off += elib_protocol_build_meta(tx + off, sizeof(tx) - off, 0x0001u,
+                                    ELIB_PROTOCOL_DATA_U32, tmp, 4u);
+    off += elib_protocol_build_meta(tx + off, sizeof(tx) - off, 0x0002u,
+                                    ELIB_PROTOCOL_DATA_ARRAY, payload3, 3u);
+    frame_len = (uint16_t)elib_protocol_build_pack_crc(tx, sizeof(tx), off,
+                                                       inverted_crc16, NULL);
+
+    /* matching algorithms on both ends: delivered, and the hook saw
+     * the exact coverage slice head..data-end */
+    assert(elib_protocol_host_feed(&host, tx, frame_len) == ELIB_PROTOCOL_OK);
+    assert_captured_frame(17u, addr_own);
+    assert(crc_probe.saw_len == (size_t)frame_len - 3u);
+    assert(crc_probe.saw_first == (uint8_t)ELIB_PROTOCOL_FRAME_HEAD);
+    assert(crc_probe.saw_last == tx[frame_len - 4u]);
+
+    /* same octets sealed with the built-in algorithm instead: the two
+     * ends disagree, the frame must die with CHECKSUM */
+    capture_reset();
+    frame_len = (uint16_t)elib_protocol_build_pack(tx, sizeof(tx), off);
+    assert(elib_protocol_host_feed(&host, tx, frame_len)
+           == ELIB_PROTOCOL_ERR_CHECKSUM);
+    assert(cap_count == 0u);
+
+    printf("PASSED\n");
+}
+
 static void test_slave_address_filter(void) {
     uint16_t frame_len;
     elib_protocol_bufs_t good = { slave_buf, (uint16_t)sizeof(slave_buf) };
@@ -441,7 +507,7 @@ static void test_reentrancy_guard(void) {
     uint16_t frame_len;
     static uint8_t reent_buf[RE_BUF_SIZE];
     static elib_protocol_bufs_t good = { reent_buf, RE_BUF_SIZE };
-    static elib_protocol_ops_t probe_ops = { NULL, reent_cb };
+    static elib_protocol_ops_t probe_ops = { NULL, reent_cb, NULL };
 
     printf("Test: on_frame reentering feed is refused with BUSY... ");
 
@@ -480,6 +546,12 @@ static void test_reentry_and_guards(void) {
         assert(elib_protocol_build_pack(scratch, 64u, off + 4u) == 0u);
     }
 
+    {   /* pack_crc refuses a NULL checksum function outright */
+        uint8_t scratch[64];
+        size_t off = elib_protocol_build_header(scratch, 64u, addr_own, 1u, 0u);
+        assert(elib_protocol_build_pack_crc(scratch, 64u, off, NULL, NULL) == 0u);
+    }
+
     printf("PASSED\n");
 }
 
@@ -490,6 +562,7 @@ int main(void) {
     test_bogus_then_valid_claim();
     test_oversized_claim_swallowed();
     test_crc_and_tail_rejects();
+    test_custom_checksum();
     test_slave_address_filter();
     test_head_inside_payload_survives();
     test_reset_mid_frame();

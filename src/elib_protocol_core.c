@@ -1,371 +1,373 @@
+/* elib_protocol_core.c - shared protocol engine
+ *
+ * Streaming parser: bytes arrive one at a time (array feeder is a
+ * loop over the very same path), each byte is consumed exactly once,
+ * so there is no head re-scanning and no snapshot bookkeeping. Frame
+ * progress is bounded by the LENGTH field: the reassembly buffer only
+ * ever stores a frame whose claimed size fit - a bogus or oversized
+ * claim never occupies buffer space (anti-clog gate #1).
+ *
+ * Dropped frames follow two deterministic routines:
+ *   bogus claim (LEN < minimum)  - discard the 3 consumed bytes and
+ *                                  go back to hunting immediately
+ *   rejected claim (LEN > buffer, foreign address) - swallow the
+ *                                  remaining quota byte by byte, then
+ *                                  resync strictly at the next 0x68
+ * The payload is NEVER re-hunted for new heads mid-frame (the wire has
+ * no escaping; a 0x68 inside fdata is ordinary data).
+ */
 #include "elib_protocol_core.h"
 #include <string.h>
 
-void elib_protocol_parse_init(elib_protocol_parse_ctx_t *ctx)
-{
-    if (!ctx) {
-        return;
-    }
-    ctx->state  = ELIB_PROTOCOL_STATE_IDLE;
-    ctx->length = 0;
-    ctx->rx_cnt = 0;
-    ctx->crc    = 0;
-}
+#define CRC_INIT 0xFFFFu
+#define CRC_POLY 0x1021u
 
-uint16_t elib_protocol_crc16_calc(const uint8_t *data, size_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; i++) {
+/* ---- CRC ---- */
+
+uint16_t elib_protocol_crc16(const uint8_t *data, size_t len) {
+    uint16_t crc = CRC_INIT;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        uint16_t j;
         crc ^= (uint16_t)data[i] << 8;
-        for (int j = 0; j < 8; j++) {
-            if (crc & 0x8000) {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc <<= 1;
-            }
+        for (j = 0; j < 8; j++) {
+            crc = (crc & 0x8000u) ? (uint16_t)(crc << 1) ^ CRC_POLY
+                                  : (uint16_t)(crc << 1);
         }
     }
     return crc;
 }
 
-uint8_t elib_protocol_desc_get_type(uint8_t desc)
-{
-    return desc & ELIB_PROTOCOL_DESC_TYPE_MASK;
-}
-
-uint8_t elib_protocol_desc_get_frag(uint8_t desc)
-{
-    return desc & ELIB_PROTOCOL_DESC_FRAG_MASK;
-}
-
-uint8_t elib_protocol_desc_get_dir(uint8_t desc)
-{
-    return desc & ELIB_PROTOCOL_DESC_DIR_MASK;
-}
-
-elib_protocol_err_t elib_protocol_parse_byte(elib_protocol_parse_ctx_t *ctx,
-                                               uint8_t byte,
-                                               uint8_t *frame_seq,
-                                               uint8_t *frame_desc,
-                                               size_t *frame_data_len)
-{
-    if (!ctx) {
-        return ELIB_PROTOCOL_ERR_INVALID_PARAM;
+static uint16_t crc16_step(uint16_t crc, uint8_t byte) {
+    uint16_t j;
+    crc ^= (uint16_t)byte << 8;
+    for (j = 0; j < 8; j++) {
+        crc = (crc & 0x8000u) ? (uint16_t)(crc << 1) ^ CRC_POLY
+                              : (uint16_t)(crc << 1);
     }
+    return crc;
+}
 
-    switch (ctx->state) {
+/* ---- engine lifecycle ---- */
+
+void elib_protocol_engine_init(elib_protocol_engine_t *e,
+                               const elib_protocol_ops_t *ops,
+                               const elib_protocol_bufs_t *bufs,
+                               const uint8_t *self_addr) {
+    e->ops = ops;
+    e->bufs = *bufs;
+    e->self_addr = self_addr;
+    e->state = ELIB_PROTOCOL_STATE_IDLE;
+    e->claim = 0;
+    e->filled = 0;
+    e->swallow = 0;
+    e->crc_run = CRC_INIT;
+    e->crc_rx = 0;
+    e->bit_flags.initialized = 1;
+    e->bit_flags.busy = 0;
+}
+
+void elib_protocol_engine_reset(elib_protocol_engine_t *e) {
+    e->state = ELIB_PROTOCOL_STATE_IDLE;
+    e->claim = 0;
+    e->filled = 0;
+    e->swallow = 0;
+    e->crc_run = CRC_INIT;
+    e->crc_rx = 0;
+    /* busy stays off: nothing inside a callback survives a reset */
+    e->bit_flags.busy = 0;
+}
+
+/* store one byte into the reassembly buffer and fold it into the
+ * running CRC (CRC field bytes and the tail must bypass the CRC fold) */
+static void store(elib_protocol_engine_t *e, uint8_t byte) {
+    e->bufs.frame_buf[e->filled] = byte;
+    e->filled++;
+    e->crc_run = crc16_step(e->crc_run, byte);
+}
+
+static elib_protocol_err_t feed_one(elib_protocol_engine_t *e, uint8_t byte) {
+    switch (e->state) {
+
     case ELIB_PROTOCOL_STATE_IDLE:
-        if (byte == ELIB_PROTOCOL_FRAME_HEAD) {
-            ctx->state  = ELIB_PROTOCOL_STATE_LEN_H;
-            ctx->rx_cnt = 0;
+        /* discarded noise never touches the buffer */
+        if (byte == (uint8_t)ELIB_PROTOCOL_FRAME_HEAD) {
+            e->bufs.frame_buf[0] = byte;
+            e->filled = 1;
+            /* the head itself is inside the CRC scope */
+            e->crc_run = crc16_step(CRC_INIT, byte);
+            e->state = ELIB_PROTOCOL_STATE_LEN_H;
         }
-        break;
+        return ELIB_PROTOCOL_OK;
 
     case ELIB_PROTOCOL_STATE_LEN_H:
-        ctx->length = (uint16_t)byte << 8;
-        ctx->state  = ELIB_PROTOCOL_STATE_LEN_L;
-        break;
+        store(e, byte);
+        e->state = ELIB_PROTOCOL_STATE_LEN_L;
+        return ELIB_PROTOCOL_OK;
 
-    case ELIB_PROTOCOL_STATE_LEN_L:
-        ctx->length |= byte;
-        if (ctx->length < ELIB_PROTOCOL_FRAME_LEN_MIN) {
-            ctx->state = ELIB_PROTOCOL_STATE_IDLE;
-        } else {
-            ctx->state  = ELIB_PROTOCOL_STATE_ADDR0;
-            ctx->rx_cnt = 0;
+    case ELIB_PROTOCOL_STATE_LEN_L: {
+        uint16_t claim;
+        store(e, byte);
+        claim = elib_protocol_get_u16(&e->bufs.frame_buf[1]);
+        if (claim < ELIB_PROTOCOL_FRAME_LEN_MIN) {
+            /* bogus claim: no trustworthy quota to swallow - drop the
+             * 3 consumed bytes and hunt from the NEXT 0x68 */
+            e->state = ELIB_PROTOCOL_STATE_IDLE;
+            e->filled = 0;
+            return ELIB_PROTOCOL_ERR_FRAME;
         }
-        break;
+        if (claim > e->bufs.frame_buf_size) {
+            /* coherent but unstoreable: swallow the declared quota,
+             * then resync strictly */
+            e->swallow = (uint16_t)(claim - e->filled);
+            e->state = ELIB_PROTOCOL_STATE_SWALLOW;
+            e->filled = 0;
+            return ELIB_PROTOCOL_ERR_FRAME;
+        }
+        e->claim = claim;
+        e->state = ELIB_PROTOCOL_STATE_ADDR0;
+        return ELIB_PROTOCOL_OK;
+    }
 
     case ELIB_PROTOCOL_STATE_ADDR0:
     case ELIB_PROTOCOL_STATE_ADDR1:
     case ELIB_PROTOCOL_STATE_ADDR2:
-    case ELIB_PROTOCOL_STATE_ADDR3:
-        ctx->state++;
-        break;
+        store(e, byte);
+        e->state = (uint8_t)(e->state + 1u);
+        return ELIB_PROTOCOL_OK;
+
+    case ELIB_PROTOCOL_STATE_ADDR3: {
+        store(e, byte);
+        /* address filter: only own station and broadcast pass */
+        if (e->self_addr != NULL) {
+            const uint8_t *a = &e->bufs.frame_buf[3];
+            uint8_t broadcast = (uint8_t)((a[0] == 0xFFu) && (a[1] == 0xFFu) &&
+                                          (a[2] == 0xFFu) && (a[3] == 0xFFu));
+            if (!broadcast && memcmp(a, e->self_addr, 4) != 0) {
+                e->swallow = (uint16_t)(e->claim - e->filled);
+                e->filled = 0;
+                e->state = ELIB_PROTOCOL_STATE_SWALLOW;
+                return ELIB_PROTOCOL_OK; /* silent: multi-drop normality */
+            }
+        }
+        e->state = ELIB_PROTOCOL_STATE_SEQ;
+        return ELIB_PROTOCOL_OK;
+    }
 
     case ELIB_PROTOCOL_STATE_SEQ:
-        ctx->seq    = byte;
-        ctx->state  = ELIB_PROTOCOL_STATE_DESC;
-        break;
+        store(e, byte);
+        e->state = ELIB_PROTOCOL_STATE_DESC;
+        return ELIB_PROTOCOL_OK;
 
     case ELIB_PROTOCOL_STATE_DESC:
-        ctx->desc   = byte;
-        ctx->state  = ELIB_PROTOCOL_STATE_DATA;
-        ctx->rx_cnt = 0;
-        break;
+        store(e, byte);
+        e->state = (e->filled == (uint16_t)(e->claim - 3u))
+                       ? ELIB_PROTOCOL_STATE_CRC_H   /* empty data */
+                       : ELIB_PROTOCOL_STATE_DATA;
+        return ELIB_PROTOCOL_OK;
 
     case ELIB_PROTOCOL_STATE_DATA:
-        ctx->rx_cnt++;
-        if (ctx->rx_cnt >= ctx->length - ELIB_PROTOCOL_FRAME_OVERHEAD) {
-            ctx->state = ELIB_PROTOCOL_STATE_CRC_H;
+        store(e, byte);
+        if (e->filled == (uint16_t)(e->claim - 3u)) {
+            e->state = ELIB_PROTOCOL_STATE_CRC_H;
         }
-        break;
+        return ELIB_PROTOCOL_OK;
 
     case ELIB_PROTOCOL_STATE_CRC_H:
-        ctx->crc   = (uint16_t)byte << 8;
-        ctx->state = ELIB_PROTOCOL_STATE_CRC_L;
-        break;
+        e->bufs.frame_buf[e->filled++] = byte; /* not folded into CRC */
+        e->state = ELIB_PROTOCOL_STATE_CRC_L;
+        return ELIB_PROTOCOL_OK;
 
     case ELIB_PROTOCOL_STATE_CRC_L:
-        ctx->crc |= byte;
-        ctx->state = ELIB_PROTOCOL_STATE_TAIL;
-        break;
+        e->bufs.frame_buf[e->filled++] = byte; /* not folded into CRC */
+        e->crc_rx = elib_protocol_get_u16(&e->bufs.frame_buf[e->claim - 3u]);
+        e->state = ELIB_PROTOCOL_STATE_TAIL;
+        return ELIB_PROTOCOL_OK;
 
-    case ELIB_PROTOCOL_STATE_TAIL:
-        ctx->state = ELIB_PROTOCOL_STATE_IDLE;
-        if (byte != ELIB_PROTOCOL_FRAME_TAIL) {
+    case ELIB_PROTOCOL_STATE_TAIL: {
+        elib_protocol_frame_ctx_t frame;
+
+        e->state = ELIB_PROTOCOL_STATE_IDLE;
+        if (byte != (uint8_t)ELIB_PROTOCOL_FRAME_TAIL) {
             return ELIB_PROTOCOL_ERR_FRAME;
         }
-        if (frame_seq) {
-            *frame_seq = ctx->seq;
+        if (e->crc_rx != e->crc_run) {
+            return ELIB_PROTOCOL_ERR_CHECKSUM;
         }
-        if (frame_desc) {
-            *frame_desc = ctx->desc;
-        }
-        if (frame_data_len) {
-            *frame_data_len = ctx->rx_cnt;
+
+        /* full frame: deliver with pointers into the frozen buffer */
+        (void)memcpy(frame.addr, &e->bufs.frame_buf[3], 4);
+        frame.seq = e->bufs.frame_buf[7];
+        frame.desc = e->bufs.frame_buf[8];
+        frame.data = &e->bufs.frame_buf[ELIB_PROTOCOL_HDR_SIZE];
+        frame.data_len = (uint16_t)(e->claim - 12u);
+        e->bit_flags.busy = 1;
+        e->ops->on_frame(e->ops->user_data, &frame);
+        e->bit_flags.busy = 0;
+
+        /* buffer write position and parse state recycle for the next
+         * frame right here - no stale bytes survive the callback */
+        e->filled = 0;
+        e->claim = 0;
+        return ELIB_PROTOCOL_OK;
+    }
+
+    case ELIB_PROTOCOL_STATE_SWALLOW:
+        if (--e->swallow == 0u) {
+            e->state = ELIB_PROTOCOL_STATE_IDLE;
         }
         return ELIB_PROTOCOL_OK;
 
     default:
-        ctx->state = ELIB_PROTOCOL_STATE_IDLE;
-        break;
+        e->state = ELIB_PROTOCOL_STATE_IDLE;
+        return ELIB_PROTOCOL_ERR_FRAME;
     }
-
-    return ELIB_PROTOCOL_ERR_FRAME;
 }
 
-uint8_t elib_protocol_meta_get_count(const uint8_t *data, size_t len)
-{
-    if (!data || len < 1) {
-        return 0;
+elib_protocol_err_t elib_protocol_engine_feed_byte(elib_protocol_engine_t *e,
+                                                   uint8_t byte) {
+    if (e == NULL || !e->bit_flags.initialized) {
+        return ELIB_PROTOCOL_ERR_NOT_INITIALIZED;
     }
-    return data[0];
+    if (e->bit_flags.busy) {
+        return ELIB_PROTOCOL_ERR_BUSY;
+    }
+    return feed_one(e, byte);
 }
 
-elib_protocol_err_t elib_protocol_get_next_meta(size_t *pos,
-                                                 const uint8_t *data,
-                                                 size_t len,
-                                                 elib_protocol_meta_t **meta)
-{
-    if (!pos || !data || !meta) {
+elib_protocol_err_t elib_protocol_engine_feed(elib_protocol_engine_t *e,
+                                              const uint8_t *bytes,
+                                              uint16_t len) {
+    elib_protocol_err_t err = ELIB_PROTOCOL_OK;
+    uint16_t i;
+
+    if (e == NULL || !e->bit_flags.initialized) {
+        return ELIB_PROTOCOL_ERR_NOT_INITIALIZED;
+    }
+    if (bytes == NULL && len != 0u) {
         return ELIB_PROTOCOL_ERR_INVALID_PARAM;
     }
-
-    if (*pos == 0) {
-        *pos = 1;
+    if (e->bit_flags.busy) {
+        return ELIB_PROTOCOL_ERR_BUSY;
     }
 
-    if (*pos >= len) {
-        return ELIB_PROTOCOL_ERR_FRAME;
-    }
-
-    if (*pos + 5 > len) {
-        return ELIB_PROTOCOL_ERR_FRAME;
-    }
-
-    *meta = (elib_protocol_meta_t *)&data[*pos];
-    *pos += 5 + (*meta)->len;
-
-    if (*pos > len) {
-        return ELIB_PROTOCOL_ERR_FRAME;
-    }
-
-    return ELIB_PROTOCOL_OK;
-}
-
-void elib_protocol_ctx_init(elib_protocol_ctx_t *ctx)
-{
-    ctx->parse_state  = ELIB_PROTOCOL_STATE_IDLE;
-    ctx->parse_length = 0;
-    ctx->parse_rx_cnt = 0;
-    ctx->frame_pos    = 0;
-    memset(ctx->self_addr, 0, 4);
-}
-
-elib_protocol_err_t elib_protocol_process(elib_protocol_ctx_t *ctx,
-                                           uint32_t dt_ms,
-                                           size_t rx_len,
-                                           size_t *consumed,
-                                           uint8_t dir)
-{
-    if (!ctx) {
-        return ELIB_PROTOCOL_ERR_INVALID_PARAM;
-    }
-
-    if (consumed) {
-        *consumed = 0;
-    }
-
-    if (rx_len != ctx->prev_rx_len) {
-        ctx->tick_ms     = 0;
-        ctx->prev_rx_len = rx_len;
-
-        for (size_t i = 0; i < rx_len; i++) {
-            if (ctx->parse_state == ELIB_PROTOCOL_STATE_IDLE) {
-                if (ctx->bufs.rx_frame_buf[i] != ELIB_PROTOCOL_FRAME_HEAD) {
-                    continue;
-                }
-                ctx->frame_pos = i;
-            }
-
-            elib_protocol_parse_ctx_t p = {
-                .state  = ctx->parse_state,
-                .length = ctx->parse_length,
-                .rx_cnt = ctx->parse_rx_cnt,
-                .seq    = ctx->parse_seq,
-                .desc   = ctx->parse_desc,
-                .crc    = 0
-            };
-
-            elib_protocol_err_t err = elib_protocol_parse_byte(
-                &p, ctx->bufs.rx_frame_buf[i],
-                &ctx->parse_seq, &ctx->parse_desc, NULL);
-
-            ctx->parse_state  = p.state;
-            ctx->parse_length = p.length;
-            ctx->parse_rx_cnt = p.rx_cnt;
-
-            if (ctx->parse_state == ELIB_PROTOCOL_STATE_SEQ) {
-                if (ctx->frame_pos + ctx->parse_length > ctx->bufs.rx_frame_buf_size) {
-                    ctx->parse_state = ELIB_PROTOCOL_STATE_IDLE;
-                    continue;
-                }
-
-                uint8_t self_addr_valid = (ctx->self_addr[0] != 0x00 ||
-                                           ctx->self_addr[1] != 0x00 ||
-                                           ctx->self_addr[2] != 0x00 ||
-                                           ctx->self_addr[3] != 0x00);
-                if (self_addr_valid) {
-                    uint8_t *addr = &ctx->bufs.rx_frame_buf[ctx->frame_pos + 3];
-                    uint8_t is_broadcast = (addr[0] == 0xFF && addr[1] == 0xFF &&
-                                            addr[2] == 0xFF && addr[3] == 0xFF);
-                    if (!is_broadcast &&
-                        memcmp(addr, ctx->self_addr, 4) != 0) {
-                        ctx->parse_state = ELIB_PROTOCOL_STATE_IDLE;
-                        continue;
-                    }
-                }
-            }
-
-            if (err == ELIB_PROTOCOL_OK) {
-                uint16_t crc_calc = elib_protocol_crc16_calc(
-                    &ctx->bufs.rx_frame_buf[ctx->frame_pos],
-                    ctx->parse_length - 2);
-                if (crc_calc != p.crc) {
-                    err = ELIB_PROTOCOL_ERR_CHECKSUM;
-                }
-            }
-
-            if (err == ELIB_PROTOCOL_OK) {
-                if (ctx->ops->on_frame &&
-                    elib_protocol_desc_get_dir(ctx->parse_desc) == dir) {
-                    uint8_t *addr = &ctx->bufs.rx_frame_buf[ctx->frame_pos + 3];
-                    elib_protocol_frame_ctx_t frame = {
-                        .addr     = {addr[0], addr[1], addr[2], addr[3]},
-                        .seq      = ctx->parse_seq,
-                        .desc     = ctx->parse_desc,
-                        .data     = &ctx->bufs.rx_frame_buf[ctx->frame_pos + ELIB_PROTOCOL_FRAME_OVERHEAD],
-                        .data_len = ctx->parse_rx_cnt
-                    };
-                    ctx->ops->on_frame(&frame);
-                }
-
-                if (consumed) {
-                    *consumed = i + 1;
-                }
-            }
-            elib_protocol_ctx_init(ctx);
-            break;
-        }
-
-        if (consumed && *consumed == 0) {
-            *consumed = ctx->frame_pos;
-        }
-    } else {
-        ctx->tick_ms += dt_ms;
-
-        if (ctx->tick_ms >= ctx->timeout_cfg) {
-            if (consumed) {
-                *consumed = rx_len;
-            }
-            ctx->tick_ms     = 0;
-            ctx->prev_rx_len = 0;
-            elib_protocol_ctx_init(ctx);
+    for (i = 0; i < len; i++) {
+        elib_protocol_err_t one = feed_one(e, bytes[i]);
+        if (one != ELIB_PROTOCOL_OK) {
+            err = one; /* report the LAST discarded frame in the batch */
         }
     }
-
-    return ELIB_PROTOCOL_OK;
+    return err;
 }
+
+/* ---- builders ---- */
 
 size_t elib_protocol_build_header(uint8_t *buf, size_t buf_size,
-                                  const uint8_t *addr,
-                                  uint8_t seq, uint8_t desc)
-{
-    if (!buf || buf_size < ELIB_PROTOCOL_FRAME_OVERHEAD + 1) {
+                                  const uint8_t *addr, uint8_t seq, uint8_t desc) {
+    if (buf == NULL || buf_size < 10u) {
         return 0;
     }
-
-    buf[0] = ELIB_PROTOCOL_FRAME_HEAD;
-    buf[1] = 0;
-    buf[2] = 0;
-    if (addr) {
-        memcpy(&buf[3], addr, 4);
+    buf[0] = (uint8_t)ELIB_PROTOCOL_FRAME_HEAD;
+    elib_protocol_put_u16(&buf[1], 0); /* placeholder until build_pack */
+    if (addr != NULL) {
+        (void)memcpy(&buf[3], addr, 4);
     } else {
-        memset(&buf[3], 0xFF, 4);
+        (void)memset(&buf[3], 0xFF, 4);
     }
     buf[7] = seq;
     buf[8] = desc;
-    buf[9] = 0;
-
+    buf[9] = 0; /* meta_count placeholder until build_pack */
     return 10;
 }
 
 size_t elib_protocol_build_meta(uint8_t *buf, size_t buf_size,
                                 uint16_t id, uint8_t type,
-                                const void *data, uint16_t len)
-{
-    if (!buf || buf_size < (size_t)(5 + len)) {
+                                const void *data, uint16_t len) {
+    if (buf == NULL || (len != 0u && data == NULL)) {
         return 0;
     }
-
-    buf[0] = (id >> 8) & 0xFF;
-    buf[1] = id & 0xFF;
-    buf[2] = type;
-    buf[3] = (len >> 8) & 0xFF;
-    buf[4] = len & 0xFF;
-
-    if (len > 0 && data) {
-        memcpy(&buf[5], data, len);
+    if (buf_size < (size_t)5u + (size_t)len) {
+        return 0;
     }
-
-    return 5 + len;
+    elib_protocol_put_u16(&buf[0], id);
+    buf[2] = type;
+    elib_protocol_put_u16(&buf[3], len);
+    if (len != 0u) {
+        (void)memcpy(&buf[5], data, len);
+    }
+    return (size_t)5u + (size_t)len;
 }
 
-size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset)
-{
-    if (!buf || offset < ELIB_PROTOCOL_FRAME_OVERHEAD || offset > buf_size) {
+size_t elib_protocol_build_pack(uint8_t *buf, size_t buf_size, size_t offset) {
+    size_t pos;
+    size_t frame_len;
+    uint8_t count = 0;
+    uint16_t crc;
+
+    if (buf == NULL || offset < 10u || offset > buf_size ||
+        buf_size - offset < 3u) {
         return 0;
     }
+    frame_len = offset + 3u; /* data tail + CRC(2) + tail(1) */
 
-    size_t frame_len = offset;
-    buf[1] = (frame_len >> 8) & 0xFF;
-    buf[2] = frame_len & 0xFF;
-
-    uint8_t meta_count = 0;
-    size_t pos = ELIB_PROTOCOL_FRAME_OVERHEAD;
-    while (pos < frame_len - 3) {
-        meta_count++;
-        uint16_t meta_len = ((uint16_t)buf[pos + 3] << 8) | buf[pos + 4];
-        pos += 5 + meta_len;
+    /* metadata scan: entries must tile the data region exactly */
+    pos = 10;
+    while (pos < offset) {
+        uint16_t mlen;
+        if (offset - pos < 5u) {
+            return 0;
+        }
+        if (count == 0xFFu) {
+            return 0; /* meta_count is one byte */
+        }
+        mlen = elib_protocol_get_u16(&buf[pos + 3]);
+        pos += 5u + (size_t)mlen;
+        if (pos > offset) {
+            return 0;
+        }
+        count++;
     }
-    buf[9] = meta_count;
 
-    uint16_t crc = elib_protocol_crc16_calc(buf, frame_len - 3);
-    buf[frame_len - 3] = (crc >> 8) & 0xFF;
-    buf[frame_len - 2] = crc & 0xFF;
-
-    buf[frame_len - 1] = ELIB_PROTOCOL_FRAME_TAIL;
-
+    elib_protocol_put_u8(&buf[9], count);
+    elib_protocol_put_u16(&buf[1], (uint16_t)frame_len);
+    crc = elib_protocol_crc16(buf, offset);
+    elib_protocol_put_u16(&buf[offset], crc);
+    buf[frame_len - 1u] = (uint8_t)ELIB_PROTOCOL_FRAME_TAIL;
     return frame_len;
+}
+
+/* ---- metadata iterator ---- */
+
+elib_protocol_err_t elib_protocol_get_next_meta(uint16_t *pos,
+                                                const uint8_t *data,
+                                                uint16_t len,
+                                                elib_protocol_meta_t *meta) {
+    uint32_t here;
+    uint32_t next;
+
+    if (pos == NULL || data == NULL || meta == NULL) {
+        return ELIB_PROTOCOL_ERR_INVALID_PARAM;
+    }
+
+    if (*pos == 0u) {
+        if (len < ELIB_PROTOCOL_DATA_MIN) {
+            return ELIB_PROTOCOL_ERR_FRAME; /* no meta_count at all */
+        }
+        *pos = 1; /* skip the meta_count byte */
+    }
+
+    here = (uint32_t)*pos;
+    if (here + 5u > (uint32_t)len) {
+        return ELIB_PROTOCOL_ERR_FRAME;
+    }
+    meta->id = elib_protocol_get_u16(&data[here]);
+    meta->type = data[here + 2u];
+    meta->len = elib_protocol_get_u16(&data[here + 3u]);
+    next = here + 5u + (uint32_t)meta->len;
+    if (next > (uint32_t)len) {
+        return ELIB_PROTOCOL_ERR_FRAME;
+    }
+    meta->fdata = (meta->len != 0u) ? &data[here + 5u] : NULL;
+    *pos = (uint16_t)next;
+    return ELIB_PROTOCOL_OK;
 }

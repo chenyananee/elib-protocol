@@ -1,3 +1,5 @@
+**简体中文** | [English](README.en.md)
+
 # elib-protocol
 
 轻量级主从（master/slave）总线协议 —— C99、零动态内存、零全局状态、时间零感知。
